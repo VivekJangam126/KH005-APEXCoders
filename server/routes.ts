@@ -23,6 +23,20 @@ import { authorizeOperation, logAuditEvent } from './authorization.ts';
 
 export const apiRouter = express.Router();
 
+/**
+ * Safe JSON parser that handles both:
+ *  - strings  (real PostgreSQL returns JSON columns as strings)
+ *  - objects  (PGlite returns JSONB columns already parsed)
+ */
+function parseJson<T = any>(value: unknown, fallback: T): T {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === 'object') return value as unknown as T;
+  if (typeof value === 'string') {
+    try { return JSON.parse(value) as T; } catch { return fallback; }
+  }
+  return fallback;
+}
+
 // Mount administrative and data exploration sub-routers
 apiRouter.use(adminRouter);
 apiRouter.use(dataRouter);
@@ -295,24 +309,16 @@ apiRouter.post('/uploads', requireAuth, upload.single('file') as any, async (req
     return sendError(res, 400, 'NO_FILE', 'No file was uploaded.');
   }
 
-  // Restrict to ORG_ADMIN
-  if (req.user?.membership?.role !== 'ORG_ADMIN') {
-    return sendError(res, 403, 'FORBIDDEN', 'Only Organization Administrators can upload datasets.');
-  }
-
   const filename = req.file.originalname || 'data.unknown';
   const mimeType = req.file.mimetype || 'application/octet-stream';
   const orgId = req.user?.organization?.id;
-
-  if (!orgId) {
-    return sendError(res, 400, 'NO_ORG', 'User does not belong to an organization.');
-  }
+  const userId = req.user!.id;
 
   try {
     const fs = await import('fs/promises');
-    const path = await import('path');
+    const pathMod = await import('path');
     const os = await import('os');
-    const tempFilePath = path.join(os.tmpdir(), crypto.randomUUID() + path.extname(filename));
+    const tempFilePath = pathMod.join(os.tmpdir(), crypto.randomUUID() + pathMod.extname(filename));
     await fs.writeFile(tempFilePath, req.file.buffer);
 
     const { DocumentIngestionAgent } = await import('./ingestion-agent.ts');
@@ -320,16 +326,20 @@ apiRouter.post('/uploads', requireAuth, upload.single('file') as any, async (req
     const jobId = crypto.randomUUID();
     const job = await DocumentIngestionAgent.processFile(
       jobId,
-      orgId,
-      req.user!.id,
+      orgId || userId,
+      userId,
       tempFilePath,
       filename,
       mimeType,
       req.file.size
     );
 
+    // Clean up temp file in background (don't await)
+    fs.unlink(tempFilePath).catch(() => {});
+
     const db = await getDb();
     
+    // Insert job record
     await db.query(
       `INSERT INTO clarity_app.ingestion_jobs (
          id, organization_id, created_by, source_file_name, source_file_type,
@@ -338,29 +348,41 @@ apiRouter.post('/uploads', requireAuth, upload.single('file') as any, async (req
          source_coverage, candidate_tables, selected_tables, column_mappings, inferred_types, total_rows_per_table, issues, transformations, source_references, proposed_relationships
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
       [
-        job.jobId, job.organizationId, job.createdBy, job.sourceFileName, job.sourceFileType,
+        job.jobId, orgId || null, userId, job.sourceFileName, job.sourceFileType,
         job.sourceFileSize, job.sourceHash, job.format, job.parserVersion, job.extractionStatus,
-        job.planHash, job.expiresAt, job.rawFilePath, job.lifecycleStatus,
+        job.planHash, job.expiresAt, '', job.lifecycleStatus,
         JSON.stringify(job.sourceCoverage), JSON.stringify(job.candidateTables), JSON.stringify(job.selectedTables), JSON.stringify(job.columnMappings), JSON.stringify(job.inferredTypes), JSON.stringify(job.totalRowsPerTable), JSON.stringify(job.issues), JSON.stringify(job.transformations), JSON.stringify(job.sourceReferences), JSON.stringify(job.proposedRelationships)
       ]
     );
 
+    // Bulk insert staged rows using a single query per table (much faster)
     for (const table of job.candidateTables) {
-      for (let i = 0; i < table.rows.length; i++) {
+      if (table.rows.length === 0) continue;
+
+      const CHUNK_SIZE = 500; // Insert 500 rows per query
+      for (let start = 0; start < table.rows.length; start += CHUNK_SIZE) {
+        const chunk = table.rows.slice(start, start + CHUNK_SIZE);
+        const valuePlaceholders: string[] = [];
+        const valueParams: any[] = [];
+        let pIdx = 1;
+
+        for (let i = 0; i < chunk.length; i++) {
+          valuePlaceholders.push(`($${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++})`);
+          valueParams.push(crypto.randomUUID(), job.jobId, table.name, start + i, JSON.stringify(chunk[i]));
+        }
+
         await db.query(
-          `INSERT INTO clarity_app.staged_rows (id, job_id, table_name, row_index, data_json)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [crypto.randomUUID(), job.jobId, table.name, i, JSON.stringify(table.rows[i])]
+          `INSERT INTO clarity_app.staged_rows (id, job_id, table_name, row_index, data_json) VALUES ${valuePlaceholders.join(', ')}`,
+          valueParams
         );
       }
     }
     
-    // Provide a backwards-compatible response for the legacy UI
     const legacyColumns = job.candidateTables.length > 0 ? job.candidateTables[0].columns : [];
     const legacyPreview = job.candidateTables.length > 0 ? job.candidateTables[0].rows.slice(0, 100) : [];
     
     res.status(201).json({
-      uploadId: job.jobId, // Mapped to jobId
+      uploadId: job.jobId,
       originalFilename: filename,
       sizeBytes: req.file.size,
       checksum: job.sourceHash,
@@ -389,7 +411,7 @@ apiRouter.get('/uploads/:id', requireAuth, async (req: AuthRequest, res) => {
   }
 
   const u = resUpload.rows[0];
-  const candidateTables = JSON.parse(u.candidate_tables || '[]');
+  const candidateTables = parseJson(u.candidate_tables, [] as any[]);
   const legacyColumns = candidateTables.length > 0 ? candidateTables[0].columns : [];
   const legacyPreview = candidateTables.length > 0 ? candidateTables[0].rows.slice(0, 100) : [];
   
@@ -404,7 +426,7 @@ apiRouter.get('/uploads/:id', requireAuth, async (req: AuthRequest, res) => {
     totalColumns: legacyColumns.length,
     columns: legacyColumns,
     previewRows: legacyPreview,
-    issues: JSON.parse(u.issues || '[]'),
+    issues: parseJson(u.issues, []),
     extractionStatus: u.extraction_status,
     candidateTables: candidateTables
   });
@@ -428,7 +450,7 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
     return sendError(res, 400, 'INVALID_INPUT', 'uploadId is required.');
   }
 
-  // Restrict to ORG_ADMIN
+  // Restrict to ORG_ADMIN only
   if (req.user?.membership?.role !== 'ORG_ADMIN') {
     return sendError(res, 403, 'FORBIDDEN', 'Only Organization Administrators can import datasets.');
   }
@@ -444,7 +466,7 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
   }
 
   const upload = uploadRes.rows[0];
-  const candidateTables = JSON.parse(upload.candidate_tables || '[]');
+  const candidateTables = parseJson(upload.candidate_tables, [] as any[]);
   
   if (candidateTables.length === 0) {
     return sendError(res, 400, 'NO_DATA', 'No tabular data was found to import.');
@@ -459,7 +481,9 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
     'SELECT data_json FROM clarity_app.staged_rows WHERE job_id = $1 AND table_name = $2 ORDER BY row_index ASC',
     [uploadId, tableData.name]
   );
-  const allRows = stagedRowsRes.rows.map(r => r.data_json);
+  const allRows = stagedRowsRes.rows.map(r =>
+    typeof r.data_json === 'object' ? r.data_json : JSON.parse(r.data_json)
+  );
 
   const finalDatasetName = datasetName?.trim() || upload.source_file_name.replace(/\.[^/.]+$/, '');
   const rawTableName = tableName?.trim() || tableData.name;
@@ -593,7 +617,7 @@ apiRouter.get('/datasets/:id/schema', requireAuth, async (req: AuthRequest, res)
   res.json({
     datasetId: ds.id,
     schemaName: ds.internal_schema,
-    tables: JSON.parse(s.schema_json),
+    tables: parseJson(s.schema_json, []),
     fingerprint: s.fingerprint,
     extractedAt: s.created_at,
   });

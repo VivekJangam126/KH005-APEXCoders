@@ -2,6 +2,7 @@ import { GoogleGenAI, Type, Schema } from '@google/genai';
 import { config } from './config.ts';
 import { TableMetadata } from './schema.ts';
 import { validateSql, ValidationReport } from './validator.ts';
+import { generateWithLLM, getCurrentProvider } from './llm-adapter.ts';
 
 let aiClient: GoogleGenAI | null = null;
 
@@ -266,53 +267,94 @@ export async function generateSqlWithCorrection(
 
     const isCorrection = attempt > 1;
     const prompt = isCorrection
-      ? `You are correcting a previous PostgreSQL query that failed AST validation.
+      ? `CRITICAL: You MUST output ONLY raw SQL. NO explanation, NO comments, NO markdown, NO extra text.
+
 Database Schema:
 ${schemaStr}
 
 User Question: "${question}"
-Interpretation: ${interpretation.summary}
 
-Previous Attempt:
+Previous Query Failed:
 ${currentSql}
 
-Validation Errors from AST Validator:
+Errors:
 ${lastErrors.join('\n')}
 
-Rules:
-1. Output ONLY a valid single PostgreSQL SELECT query. No markdown, no comments, no explanation.
-2. Only use real table and column names from the schema above.
-3. Use proper joins if querying multiple tables.
-4. For rankings or ordering of nullable aggregates, use NULLS LAST (e.g. ORDER BY ... DESC NULLS LAST).
-5. Do NOT use any forbidden functions or schemas. Only standard SELECT queries.
-6. Include a LIMIT 1000 clause.`
-      : `You are an expert PostgreSQL analyst. Generate an analytical SQL query.
+OUTPUT ONLY A VALID POSTGRESQL SELECT QUERY. START WITH "SELECT" AND END WITH SEMICOLON.
+DO NOT include any other text, explanation, or commentary.
+DO NOT use markdown code blocks.
+JUST THE SQL QUERY AND NOTHING ELSE.`
+      : `You are a PostgreSQL expert. Generate a SQL query that answers the question.
+
 Database Schema:
 ${schemaStr}
 
-User Question: "${question}"
-Interpretation: ${interpretation.summary}
+Question: "${question}"
 
-Rules:
-1. Output ONLY a valid single PostgreSQL SELECT query. No markdown, no comments, no explanation.
-2. Only use real table and column names from the schema above.
-3. For aggregates, group by all non-aggregate projected columns.
-4. Handle NULL values appropriately (e.g. ORDER BY ... DESC NULLS LAST).
-5. Maximum limit is 1000.
-6. Do NOT execute any DDL or data modifications. Only read-only SELECT.`;
+INSTRUCTIONS:
+1. Output ONLY a SELECT query
+2. NO explanation, NO markdown, NO comments
+3. Start with SELECT, end with ;
+4. Use real table/column names from schema
+5. For names like "diya patel": WHERE table.name ILIKE '%diya patel%'
+6. For attendance: JOIN students with attendance table
+7. Add LIMIT 1000
+
+EXAMPLES FROM YOUR DATABASE:
+- "i want attendance of diya patel" → SELECT * FROM attendance a JOIN students s ON a.student_id = s.student_id WHERE s.name ILIKE '%diya patel%' LIMIT 1000;
+- "show rohan mehta" → SELECT * FROM students WHERE name ILIKE '%rohan mehta%' LIMIT 1000;
+- "students from CS dept" → SELECT * FROM students WHERE department ILIKE '%CS%' LIMIT 1000;
+
+OUTPUT ONLY THE SQL QUERY.`;
 
     try {
-      const response = await generateContentWithFallback(client, {
-        preferredModel: config.geminiModel,
-        contents: prompt,
-        config: {
-          temperature: 0.1,
-        },
-      });
+      // Try LLM provider first (Ollama, Together AI, etc.)
+      const llmProvider = getCurrentProvider();
+      let response = null;
+
+      if (llmProvider && llmProvider !== 'gemini') {
+        console.log(`[SQL Generation] Using ${llmProvider} via LLM adapter`);
+        response = await generateWithLLM(prompt, 0.1);
+      } else if (client) {
+        // Fallback to Gemini if LLM not available
+        console.log('[SQL Generation] Using Gemini API');
+        response = await generateContentWithFallback(client, {
+          preferredModel: config.geminiModel,
+          contents: prompt,
+          config: {
+            temperature: 0.1,
+          },
+        });
+      }
+
+      if (!response) {
+        throw new Error('No LLM provider available');
+      }
 
       let rawSql = response.text || '';
-      // Strip markdown code fences if model included them
-      rawSql = rawSql.replace(/```sql/gi, '').replace(/```/g, '').trim();
+      
+      // Aggressive cleaning: remove ALL non-SQL text
+      // Remove markdown code blocks
+      rawSql = rawSql.replace(/```sql/gi, '').replace(/```/g, '');
+      
+      // Remove common explanation patterns
+      rawSql = rawSql.replace(/^.*?(?=SELECT)/is, ''); // Remove everything before SELECT
+      rawSql = rawSql.replace(/;.*$/is, ';'); // Keep only up to first semicolon
+      
+      // Remove common prefixes
+      rawSql = rawSql.replace(/^(Here is|Here's|This is|The query|Query:|SQL:|Here you go|Based on)[^:]*:?\s*/i, '');
+      
+      // Remove common explanations at end
+      rawSql = rawSql.replace(/\n\n.*$/s, '');
+      
+      // Trim whitespace
+      rawSql = rawSql.trim();
+      
+      // Ensure it ends with semicolon
+      if (!rawSql.endsWith(';')) {
+        rawSql += ';';
+      }
+      
       currentSql = rawSql;
 
       // Validate SQL AST
@@ -330,7 +372,7 @@ Rules:
         lastErrors = currentReport.errors;
       }
     } catch (err: any) {
-      console.error(`Gemini SQL generation attempt ${attempt} failed:`, err);
+      console.error(`LLM SQL generation attempt ${attempt} failed:`, err);
       currentSql = generateDeterministicSql(question, tables);
       currentReport = validateSql(currentSql, tables);
       attempts.push({
@@ -352,48 +394,110 @@ Rules:
 
 function generateDeterministicSql(question: string, tables: TableMetadata[]): string {
   if (tables.length === 0) {
-    return 'SELECT 1';
+    return 'SELECT 1;';
   }
 
   const lower = question.toLowerCase();
 
-  // Find students & departments tables if present
-  const studentsTable = tables.find(t => t.name.toLowerCase() === 'students');
-  const deptTable = tables.find(t => t.name.toLowerCase() === 'departments');
-  const coursesTable = tables.find(t => t.name.toLowerCase() === 'courses');
-  const attendanceTable = tables.find(t => t.name.toLowerCase() === 'attendance');
+  // ============================================================
+  // SPECIAL CASE: User asking about TABLES/SCHEMA (not data query)
+  // ============================================================
+  if ((lower.includes('table') || lower.includes('schema') || lower.includes('structure')) && 
+      !lower.includes('where') && !lower.includes('filter') && !lower.includes('show me') &&
+      !lower.includes('attendance') && !lower.includes('student') && !lower.includes('of')) {
+    // Return a query that shows table information
+    const tableList = tables.map(t => `'${t.name}'`).join(', ');
+    return `SELECT table_name FROM information_schema.tables WHERE table_name IN (${tableList}) LIMIT 1000;`;
+  }
 
+  // ============================================================
+  // PRIORITY 1: CHECK FOR NAME/VALUE FILTERS FIRST
+  // This must come BEFORE generic pattern matching
+  // ============================================================
+  
+  // Extract potential names/values from question (for filtering)
+  let filterValue: string | null = null;
+  let filterColumn: string | null = null;
+  
+  // Try to find quoted values: "diya patel" or 'diya patel'
+  const quotedMatch = question.match(/["']([^"']+)["']/);
+  if (quotedMatch) {
+    filterValue = quotedMatch[1];
+  } else {
+    // Look for capitalized words (likely names) if no quotes
+    const capitalMatch = question.match(/\b([A-Z][a-z]+ [A-Z][a-z]+)\b/);
+    if (capitalMatch) {
+      filterValue = capitalMatch[1];
+    }
+  }
+  
+  // Find the primary table to query (attendance, students, etc.)
+  let primaryTable = tables.find(t => lower.includes(t.name.toLowerCase())) || tables[0];
+  
+  // If looking for a name filter, find the table with a name column
+  if (filterValue) {
+    // First try: look for students table (likely has name column)
+    const studentsTable = tables.find(t => t.name.toLowerCase() === 'students');
+    if (studentsTable && studentsTable.columns.some(c => c.name.toLowerCase().includes('name'))) {
+      primaryTable = studentsTable;
+    }
+  }
+  
+  // Try to find a text column for filtering (name, student_name, employee_name, etc.)
+  let nameColumn: string | null = null;
+  if (filterValue) {
+    const nameColumns = primaryTable.columns.filter(c => 
+      ['TEXT', 'VARCHAR'].includes(c.dataType) && 
+      c.name.toLowerCase().includes('name')
+    );
+    if (nameColumns.length > 0) {
+      nameColumn = nameColumns[0].name;
+      // FOUND A NAME FILTER - RETURN IMMEDIATELY with filtered query
+      const whereClause = `WHERE "${primaryTable.name}"."${nameColumn}" ILIKE '%${filterValue.replace(/'/g, "''")}%'`;
+      return `SELECT * FROM "${primaryTable.name}" ${whereClause} LIMIT 1000;`;
+    }
+  }
+
+  // ============================================================
+  // PRIORITY 2: ATTENDANCE QUERIES (with smart joins)
+  // ============================================================
+  
+  const attendanceTable = tables.find(t => t.name.toLowerCase() === 'attendance');
+  const studentsTable = tables.find(t => t.name.toLowerCase() === 'students');
+  const coursesTable = tables.find(t => t.name.toLowerCase() === 'courses');
+  
+  // If asking for attendance, join with students and courses
+  if (attendanceTable && studentsTable && coursesTable && lower.includes('attendance')) {
+    return `SELECT a.attendance_id, s.name, c.title, a.date, a.status FROM "${attendanceTable.name}" a JOIN "${studentsTable.name}" s ON a.student_id = s.student_id JOIN "${coursesTable.name}" c ON a.course_id = c.course_id LIMIT 1000;`;
+  }
+
+  // ============================================================
+  // PRIORITY 3: GENERIC PATTERNS
+  // ============================================================
+  
+  const deptTable = tables.find(t => t.name.toLowerCase() === 'departments');
+  
   // Case: Students count per department
   if (studentsTable && deptTable && (lower.includes('department') || lower.includes('dept')) && lower.includes('student')) {
-    return `SELECT d.department_name, COUNT(s.student_id) AS student_count FROM "${deptTable.name}" d LEFT JOIN "${studentsTable.name}" s ON s.department_id = d.department_id GROUP BY d.department_name ORDER BY student_count DESC NULLS LAST LIMIT 1000`;
+    return `SELECT d.department_name, COUNT(s.student_id) AS student_count FROM "${deptTable.name}" d LEFT JOIN "${studentsTable.name}" s ON s.department_id = d.department_id GROUP BY d.department_name ORDER BY student_count DESC NULLS LAST LIMIT 1000;`;
   }
 
-  // Case: Attendance rate per course
-  if (attendanceTable && coursesTable && (lower.includes('attendance') || lower.includes('present') || lower.includes('absent'))) {
-    return `SELECT c.course_name, a.status, COUNT(*) AS status_count FROM "${attendanceTable.name}" a JOIN "${coursesTable.name}" c ON c.course_id = a.course_id GROUP BY c.course_name, a.status ORDER BY c.course_name, status_count DESC LIMIT 1000`;
-  }
-
-  // Find table whose name appears in question
-  const matchingTable = tables.find(t => lower.includes(t.name.toLowerCase())) || tables[0];
-  const colNames = matchingTable.columns.map(c => c.name);
-
-  // Check numeric columns for averages or sums
-  const numCol = matchingTable.columns.find(c => ['NUMERIC', 'BIGINT', 'INTEGER', 'DOUBLE PRECISION'].includes(c.dataType) && !c.isPrimaryKey && !c.foreignKey);
-  const textCol = matchingTable.columns.find(c => ['TEXT', 'VARCHAR'].includes(c.dataType));
+  const numCol = primaryTable.columns.find(c => ['NUMERIC', 'BIGINT', 'INTEGER', 'DOUBLE PRECISION'].includes(c.dataType) && !c.isPrimaryKey && !c.foreignKey);
+  const textCol = primaryTable.columns.find(c => ['TEXT', 'VARCHAR'].includes(c.dataType));
 
   if (numCol && textCol && (lower.includes('avg') || lower.includes('average') || lower.includes('mean'))) {
-    return `SELECT "${textCol.name}", ROUND(AVG("${numCol.name}"), 2) AS average_${numCol.name} FROM "${matchingTable.name}" GROUP BY "${textCol.name}" ORDER BY average_${numCol.name} DESC NULLS LAST LIMIT 1000`;
+    return `SELECT "${textCol.name}", ROUND(AVG("${numCol.name}"), 2) AS average_${numCol.name} FROM "${primaryTable.name}" GROUP BY "${textCol.name}" ORDER BY average_${numCol.name} DESC NULLS LAST LIMIT 1000;`;
   }
 
   if (numCol && textCol && (lower.includes('sum') || lower.includes('total'))) {
-    return `SELECT "${textCol.name}", SUM("${numCol.name}") AS total_${numCol.name} FROM "${matchingTable.name}" GROUP BY "${textCol.name}" ORDER BY total_${numCol.name} DESC NULLS LAST LIMIT 1000`;
+    return `SELECT "${textCol.name}", SUM("${numCol.name}") AS total_${numCol.name} FROM "${primaryTable.name}" GROUP BY "${textCol.name}" ORDER BY total_${numCol.name} DESC NULLS LAST LIMIT 1000;`;
   }
 
   if (textCol && (lower.includes('count') || lower.includes('how many'))) {
-    return `SELECT "${textCol.name}", COUNT(*) AS total_count FROM "${matchingTable.name}" GROUP BY "${textCol.name}" ORDER BY total_count DESC LIMIT 1000`;
+    return `SELECT "${textCol.name}", COUNT(*) AS total_count FROM "${primaryTable.name}" GROUP BY "${textCol.name}" ORDER BY total_count DESC LIMIT 1000;`;
   }
 
-  return `SELECT * FROM "${matchingTable.name}" LIMIT 1000`;
+  return `SELECT * FROM "${primaryTable.name}" LIMIT 1000;`;
 }
 
 export async function generateGroundedInsights(

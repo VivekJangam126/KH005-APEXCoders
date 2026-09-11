@@ -5,6 +5,7 @@ import { createServer as createViteServer } from 'vite';
 import { apiRouter } from './server/routes.ts';
 import { getDb } from './server/db.ts';
 import { config } from './server/config.ts';
+import { initializeLLM } from './server/llm-adapter.ts';
 
 async function startServer() {
   const app = express();
@@ -43,6 +44,14 @@ async function startServer() {
     }
   } catch (err) {
     console.error('Failed to initialize database on startup:', err);
+  }
+
+  // Initialize LLM provider (Ollama or other)
+  try {
+    console.log('Initializing LLM provider...');
+    await initializeLLM();
+  } catch (err) {
+    console.warn('LLM provider initialization warning:', err);
   }
 
   // Mount API routes FIRST

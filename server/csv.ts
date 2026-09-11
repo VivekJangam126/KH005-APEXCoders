@@ -239,27 +239,37 @@ export async function createAndPopulateTable(
     .map(c => `"${c.internalName}" ${c.detectedType}${c.isNullable ? '' : ' NULL'}`)
     .join(', ');
 
-  const createTableSql = `CREATE TABLE "${schema}"."${tableName}" (${colDefs});`;
-  await db.exec(createTableSql);
+  await db.exec(`CREATE TABLE "${schema}"."${tableName}" (${colDefs});`);
 
   if (rows.length === 0) {
     return { rowCount: 0 };
   }
 
-  // Insert rows in batches of 200
-  const batchSize = 200;
+  const colNames = columns.map(c => `"${c.internalName}"`).join(', ');
+
+  // Bulk insert: up to 500 rows per query (each row = N columns worth of params)
+  // Max params per query = 500 * columns.length  (keep below pg limit of 65535)
+  const maxRowsPerBatch = Math.max(1, Math.floor(60000 / Math.max(columns.length, 1)));
+  const batchSize = Math.min(500, maxRowsPerBatch);
+
   for (let i = 0; i < rows.length; i += batchSize) {
     const batch = rows.slice(i, i + batchSize);
-    for (const row of batch) {
-      const colNames = columns.map(c => `"${c.internalName}"`).join(', ');
-      const placeholders = columns.map((_, idx) => `$${idx + 1}`).join(', ');
-      const values = columns.map(c => row[c.internalName] ?? null);
+    const valuePlaceholders: string[] = [];
+    const params: any[] = [];
+    let pIdx = 1;
 
-      await db.query(
-        `INSERT INTO "${schema}"."${tableName}" (${colNames}) VALUES (${placeholders})`,
-        values
-      );
+    for (const row of batch) {
+      const rowPlaceholders = columns.map(() => `$${pIdx++}`).join(', ');
+      valuePlaceholders.push(`(${rowPlaceholders})`);
+      for (const c of columns) {
+        params.push(row[c.internalName] ?? null);
+      }
     }
+
+    await db.query(
+      `INSERT INTO "${schema}"."${tableName}" (${colNames}) VALUES ${valuePlaceholders.join(', ')}`,
+      params
+    );
   }
 
   return { rowCount: rows.length };
