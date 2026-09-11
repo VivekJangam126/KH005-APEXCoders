@@ -618,7 +618,7 @@ Document Name: ${filename}
   }
 
   const response = await generateContentWithFallback(client, {
-    preferredModel: 'gemini-3.8-flash',
+    preferredModel: config.geminiModel, // use the configured model, not a hardcoded invalid name
     contents: contents,
     config: {
       temperature: 0.1,

@@ -328,6 +328,17 @@ apiRouter.post('/uploads', requireAuth, upload.single('file') as any, async (req
       req.file.size
     );
 
+    // Structured diagnostic log (no credentials, no full row payloads)
+    console.log(`[Ingestion] jobId=${jobId} file="${filename}" format=${job.format} status=${job.extractionStatus} tables=${job.candidateTables.length} issues=${job.issues.length}`);
+    for (const t of job.candidateTables) {
+      console.log(`[Ingestion]   table="${t.name}" rows=${t.rowCount} cols=${t.columns.length}`);
+    }
+    if (job.issues.length > 0) {
+      for (const iss of job.issues) {
+        console.warn(`[Ingestion]   issue[${iss.severity}] row=${iss.row ?? '-'} col=${iss.column ?? '-'}: ${iss.message}`);
+      }
+    }
+
     const db = await getDb();
     
     await db.query(
@@ -454,12 +465,19 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
   const tableData = candidateTables[0];
   const columns = tableData.columns;
   
-  // Fetch rows from staged_rows
+  // Fetch rows from staged_rows — JSONB columns are returned as parsed JS objects by the pg driver
   const stagedRowsRes = await db.query(
     'SELECT data_json FROM clarity_app.staged_rows WHERE job_id = $1 AND table_name = $2 ORDER BY row_index ASC',
     [uploadId, tableData.name]
   );
-  const allRows = stagedRowsRes.rows.map(r => r.data_json);
+  // data_json is JSONB — pg returns it already parsed; no JSON.parse needed
+  const allRows: Record<string, any>[] = stagedRowsRes.rows.map(r => r.data_json as Record<string, any>);
+
+  if (allRows.length === 0 && tableData.rowCount > 0) {
+    // Staged rows were cleaned up or never written — fall back to candidateTables rows in job record
+    console.warn(`[Import] staged_rows empty for job ${uploadId} table "${tableData.name}", falling back to candidate_tables rows`);
+    allRows.push(...(tableData.rows || []));
+  }
 
   const finalDatasetName = datasetName?.trim() || upload.source_file_name.replace(/\.[^/.]+$/, '');
   const rawTableName = tableName?.trim() || tableData.name;
@@ -489,6 +507,17 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
 
     // 2. Create and populate table
     const result = await createAndPopulateTable(db, internalSchema, finalTableName, columns, allRows);
+
+    // Verify actual row count matches plan — fail loudly if they diverge
+    const verifyRes = await db.query<{ cnt: string }>(
+      `SELECT COUNT(*) as cnt FROM "${internalSchema}"."${finalTableName}"`
+    );
+    const actualRowCount = parseInt(verifyRes.rows[0]?.cnt || '0', 10);
+    if (actualRowCount !== result.rowCount) {
+      console.error(`[Import] Row count mismatch: plan=${result.rowCount} actual=${actualRowCount} job=${uploadId}`);
+    } else {
+      console.log(`[Import] Verified: ${actualRowCount} rows stored in "${internalSchema}"."${finalTableName}" (job=${uploadId})`);
+    }
 
     // 3. Register table in dataset_tables
     await db.query(

@@ -566,7 +566,6 @@ dataRouter.post('/datasets/:id/tables/:table/append-csv', requireAuth, async (re
     }
     const ds = dsRes.rows[0];
 
-    // Requires 'import_csv' (which in turn requires both read and insert)
     const authCheck = authorizeOperation(
       req.user,
       {
@@ -581,7 +580,6 @@ dataRouter.post('/datasets/:id/tables/:table/append-csv', requireAuth, async (re
       return sendError(res, authCheck.status, authCheck.code!, authCheck.reason!);
     }
 
-    // Inspect table schema
     const colRes = await db.query(`
       SELECT column_name, data_type, is_nullable
       FROM information_schema.columns
@@ -594,24 +592,35 @@ dataRouter.post('/datasets/:id/tables/:table/append-csv', requireAuth, async (re
 
     const existingCols = colRes.rows.map(c => c.column_name);
 
-    // Simple robust CSV parser
-    const lines = csvText.trim().split(/\r?\n/).filter((l: string) => l.trim().length > 0);
-    if (lines.length < 2) {
+    // Use the real CSV parser — never naive split(',')
+    const { parse: parseCsv } = await import('csv-parse/sync');
+    let records: string[][];
+    try {
+      records = parseCsv(csvText, {
+        skip_empty_lines: true,
+        relax_column_count: true,
+        trim: true,
+        bom: true,
+      });
+    } catch (parseErr: any) {
+      return sendError(res, 400, 'INVALID_CSV', `CSV parsing error: ${parseErr.message}`);
+    }
+
+    if (records.length < 2) {
       return sendError(res, 400, 'EMPTY_CSV', 'CSV must contain at least a header row and one data row.');
     }
 
-    const header = lines[0].split(',').map((h: string) => h.trim().replace(/^["']|["']$/g, ''));
-
-    // Validate headers match table columns
+    const header = records[0].map((h: string) => h.trim());
     const validHeaderCols = header.filter((h: string) => existingCols.includes(h));
     if (validHeaderCols.length === 0) {
       return sendError(res, 400, 'HEADER_MISMATCH', `None of the CSV headers match columns in table "${tableName}". Existing columns: ${existingCols.join(', ')}`);
     }
 
     let appendedCount = 0;
+    const dataRecords = records.slice(1);
 
-    for (let i = 1; i < lines.length; i++) {
-      const rowVals = lines[i].split(',').map((v: string) => v.trim().replace(/^["']|["']$/g, ''));
+    for (let i = 0; i < dataRecords.length; i++) {
+      const rowVals = dataRecords[i];
       const insertCols: string[] = [];
       const insertVals: any[] = [];
       const placeholders: string[] = [];
@@ -619,8 +628,10 @@ dataRouter.post('/datasets/:id/tables/:table/append-csv', requireAuth, async (re
       for (let j = 0; j < header.length; j++) {
         const col = header[j];
         if (existingCols.includes(col) && rowVals[j] !== undefined) {
+          const v = rowVals[j].trim();
           insertCols.push(col);
-          insertVals.push(rowVals[j]);
+          // Preserve empty string as NULL; preserve '0', 'false' as-is
+          insertVals.push(v === '' ? null : v);
           placeholders.push(`$${insertCols.length}`);
         }
       }

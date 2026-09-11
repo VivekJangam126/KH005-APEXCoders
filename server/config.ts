@@ -9,9 +9,9 @@ export const config = {
   // Universal origin - defaults to wildcards/request-origin dynamically
   appOrigin: process.env.APP_ORIGIN || process.env.APP_URL || '*',
   geminiApiKey: process.env.GEMINI_API_KEY || '',
-  geminiModel: (process.env.GEMINI_MODEL && process.env.GEMINI_MODEL !== 'gemini-2.5-flash' && process.env.GEMINI_MODEL !== 'gemini-3.8-flash')
-    ? process.env.GEMINI_MODEL
-    : 'gemini-3.6-flash',
+  geminiModel: process.env.GEMINI_MODEL && process.env.GEMINI_MODEL.trim()
+    ? process.env.GEMINI_MODEL.trim()
+    : 'gemini-2.0-flash',
   
   // Universal Database configuration:
   // Standard PostgreSQL connection URL (e.g. Cloud SQL, Supabase, Neon, RDS, or local PG)

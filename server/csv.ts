@@ -2,6 +2,16 @@ import { parse } from 'csv-parse/sync';
 import crypto from 'crypto';
 import { DatabaseAdapter } from './db.ts';
 
+/** Detect delimiter by counting occurrences in the first non-empty line. */
+function detectDelimiter(sample: string): string {
+  const line = sample.split(/\r?\n/).find(l => l.trim().length > 0) || '';
+  const counts: Record<string, number> = { ',': 0, '\t': 0, ';': 0, '|': 0 };
+  for (const ch of line) {
+    if (ch in counts) counts[ch]++;
+  }
+  return Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+}
+
 export interface ColumnInference {
   originalName: string;
   internalName: string;
@@ -38,17 +48,22 @@ export function parseAndValidateCsv(buffer: Buffer, originalFilename: string): C
   const checksum = crypto.createHash('sha256').update(buffer).digest('hex');
   const issues: { row?: number; column?: string; message: string; severity: 'warning' | 'error' }[] = [];
 
-  // Parse CSV records
+  // Detect delimiter from file content (supports CSV, TSV, semicolon-separated, pipe-separated)
+  const rawText = buffer.toString('utf-8');
+  const delimiter = detectDelimiter(rawText);
+
+  // Parse CSV records using a real parser — never naive split(',')
   let rawRecords: string[][];
   try {
     rawRecords = parse(buffer, {
+      delimiter,
       skip_empty_lines: true,
       relax_column_count: true,
       trim: true,
       bom: true,
     });
   } catch (err: any) {
-    throw new Error(`CSV parsing error: ${err.message}`);
+    throw new Error(`Delimited file parsing error: ${err.message}`);
   }
 
   if (!rawRecords || rawRecords.length === 0) {
@@ -143,29 +158,31 @@ export function parseAndValidateCsv(buffer: Buffer, originalFilename: string): C
         }
       }
 
-      // Check BOOLEAN
+      // Check BOOLEAN — must use else-if chain so a matched type does not fall through
       if (colTypes[c] === 'BOOLEAN') {
         if (/^(true|false|t|f|yes|no)$/i.test(val)) {
-          continue;
+          continue; // stays BOOLEAN
         } else {
           colTypes[c] = 'DATE';
+          // fall through to DATE check below
         }
       }
 
-      // Check DATE (YYYY-MM-DD)
+      // Check DATE (YYYY-MM-DD) — only reached when type is DATE
       if (colTypes[c] === 'DATE') {
         if (/^\d{4}-\d{2}-\d{2}$/.test(val)) {
-          continue;
+          continue; // stays DATE
         } else {
           colTypes[c] = 'TIMESTAMPTZ';
+          // fall through to TIMESTAMPTZ check below
         }
       }
 
-      // Check TIMESTAMPTZ
+      // Check TIMESTAMPTZ — only reached when type is TIMESTAMPTZ
       if (colTypes[c] === 'TIMESTAMPTZ') {
         const d = Date.parse(val);
         if (!isNaN(d) && val.length >= 10 && /\d/.test(val)) {
-          continue;
+          continue; // stays TIMESTAMPTZ
         } else {
           colTypes[c] = 'TEXT';
         }
@@ -199,7 +216,8 @@ export function parseAndValidateCsv(buffer: Buffer, originalFilename: string): C
         const n = parseFloat(val);
         rowObj[col.internalName] = isNaN(n) ? null : n;
       } else if (col.detectedType === 'BOOLEAN') {
-        rowObj[col.internalName] = /^(true|t|yes|1)$/i.test(val);
+        // Preserve false values — do NOT use truthiness. false is a valid data value.
+        rowObj[col.internalName] = /^(true|t|yes)$/i.test(val);
       } else {
         rowObj[col.internalName] = val;
       }
@@ -234,9 +252,9 @@ export async function createAndPopulateTable(
   // Drop table if exists
   await db.exec(`DROP TABLE IF EXISTS "${schema}"."${tableName}" CASCADE;`);
 
-  // Build column definitions
+  // Build column definitions — isNullable=false means NOT NULL; isNullable=true means NULL allowed
   const colDefs = columns
-    .map(c => `"${c.internalName}" ${c.detectedType}${c.isNullable ? '' : ' NULL'}`)
+    .map(c => `"${c.internalName}" ${c.detectedType}${c.isNullable ? '' : ' NOT NULL'}`)
     .join(', ');
 
   const createTableSql = `CREATE TABLE "${schema}"."${tableName}" (${colDefs});`;
