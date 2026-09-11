@@ -2,7 +2,6 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import * as xlsx from 'xlsx';
-import pdfParse from 'pdf-parse';
 import mammoth from 'mammoth';
 import { parseAndValidateCsv, sanitizeIdentifier } from './csv.ts';
 import { geminiDocumentExtraction } from './gemini.ts';

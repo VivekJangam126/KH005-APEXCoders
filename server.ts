@@ -35,6 +35,12 @@ async function startServer() {
     console.log('Bootstrapping ClaritySQL database layer...');
     await getDb();
     console.log('Database layer ready.');
+    try {
+      const { seedDemoOrganizationsAndUsers } = await import('./server/demo-seed.ts');
+      await seedDemoOrganizationsAndUsers();
+    } catch (seedErr) {
+      console.warn('Demo seed non-fatal warning:', seedErr);
+    }
   } catch (err) {
     console.error('Failed to initialize database on startup:', err);
   }

@@ -919,7 +919,7 @@ export function AdminView() {
             </p>
           </div>
 
-          <form onSubmit={handleUpdateOrg} className="space-y-4 max-w-md">
+          <form onSubmit={handleRenameOrg} className="space-y-4 max-w-md">
             <div>
               <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
                 Organization Display Name

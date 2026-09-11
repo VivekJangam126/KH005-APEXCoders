@@ -34,6 +34,7 @@ export interface SafeDbTargetInfo {
 
 export interface ConnectionHealthStatus {
   status: 'connected' | 'disconnected' | 'needs_setup';
+  ready?: boolean;
   engine: string;
   sourceVar: string | null;
   databaseName?: string;

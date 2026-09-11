@@ -290,7 +290,7 @@ apiRouter.post('/datasets/seed-sample', requireAuth, async (req: AuthRequest, re
 // ----------------------------------------------------
 // CSV Upload & Staging
 // ----------------------------------------------------
-apiRouter.post('/uploads', requireAuth, upload.single('file'), async (req: AuthRequest, res) => {
+apiRouter.post('/uploads', requireAuth, upload.single('file') as any, async (req: AuthRequest, res) => {
   if (!req.file) {
     return sendError(res, 400, 'NO_FILE', 'No file was uploaded.');
   }
@@ -658,14 +658,18 @@ apiRouter.post('/analyses', requireAuth, async (req: AuthRequest, res) => {
     return sendError(res, authCheck.status, authCheck.code!, authCheck.reason!);
   }
 
-  const analysisId = crypto.randomUUID();
-  await db.query(
-    `INSERT INTO clarity_app.analyses (id, owner_id, dataset_id, question, status)
-     VALUES ($1, $2, $3, $4, 'draft')`,
-    [analysisId, req.user!.id, datasetId, question.trim()]
-  );
+  try {
+    const analysisId = crypto.randomUUID();
+    await db.query(
+      `INSERT INTO clarity_app.analyses (id, owner_id, dataset_id, question, status, intent_json, summary)
+       VALUES ($1, $2, $3, $4, 'draft', '{}', '')`,
+      [analysisId, req.user!.id, datasetId, question.trim()]
+    );
 
-  res.status(201).json({ analysisId, status: 'draft' });
+    res.status(201).json({ analysisId, status: 'draft' });
+  } catch (err: any) {
+    return sendError(res, 500, 'ANALYSIS_CREATE_FAILED', err.message || 'Failed to create analysis.');
+  }
 });
 
 apiRouter.post('/analyses/:id/prepare', requireAuth, async (req: AuthRequest, res) => {
