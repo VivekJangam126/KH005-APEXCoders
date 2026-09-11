@@ -284,6 +284,15 @@ export const api = {
         body: JSON.stringify(permissions),
       });
     },
+    async getInvite(token: string): Promise<any> {
+      return request(`/invitations/${token}`);
+    },
+    async acceptInvite(token: string, name: string, password: string): Promise<any> {
+      return request(`/invitations/${token}/accept`, {
+        method: 'POST',
+        body: JSON.stringify({ name, password }),
+      });
+    },
   },
 
   data: {

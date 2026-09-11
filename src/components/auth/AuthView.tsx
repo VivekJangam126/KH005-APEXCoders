@@ -210,7 +210,98 @@ export function AuthView() {
             </button>
           </form>
 
+          {/* Quick Demo Personas */}
+          <div className="pt-4 border-t border-slate-100 dark:border-slate-800 space-y-2.5">
+            <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-500 dark:text-slate-400">
+              <Sparkles className="w-3.5 h-3.5 text-amber-500" />
+              <span>Quick Demo Accounts (1-Click Login)</span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <button
+                type="button"
+                id="demo-login-admin"
+                disabled={isLoading}
+                onClick={async () => {
+                  setTab('login');
+                  setEmail('admin@claritysql.internal');
+                  setPassword('ClarityAdmin2026!');
+                  setError(null);
+                  setIsLoading(true);
+                  try {
+                    await login('admin@claritysql.internal', 'ClarityAdmin2026!');
+                  } catch (err: any) {
+                    setError(err.message || 'Demo login failed');
+                  } finally {
+                    setIsLoading(false);
+                  }
+                }}
+                className="p-2 rounded-xl bg-slate-50 dark:bg-slate-800/80 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 border border-slate-200 dark:border-slate-700 text-left transition-all group"
+              >
+                <div className="text-[11px] font-bold text-slate-900 dark:text-white group-hover:text-indigo-600 dark:group-hover:text-indigo-400">
+                  Alex Morgan
+                </div>
+                <div className="text-[10px] text-slate-500 dark:text-slate-400">
+                  Org Admin
+                </div>
+              </button>
 
+              <button
+                type="button"
+                id="demo-login-editor"
+                disabled={isLoading}
+                onClick={async () => {
+                  setTab('login');
+                  setEmail('member.editor@claritysql.internal');
+                  setPassword('ClarityUser2026!');
+                  setError(null);
+                  setIsLoading(true);
+                  try {
+                    await login('member.editor@claritysql.internal', 'ClarityUser2026!');
+                  } catch (err: any) {
+                    setError(err.message || 'Demo login failed');
+                  } finally {
+                    setIsLoading(false);
+                  }
+                }}
+                className="p-2 rounded-xl bg-slate-50 dark:bg-slate-800/80 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 border border-slate-200 dark:border-slate-700 text-left transition-all group"
+              >
+                <div className="text-[11px] font-bold text-slate-900 dark:text-white group-hover:text-indigo-600 dark:group-hover:text-indigo-400">
+                  Taylor Swift
+                </div>
+                <div className="text-[10px] text-slate-500 dark:text-slate-400">
+                  Data Editor
+                </div>
+              </button>
+
+              <button
+                type="button"
+                id="demo-login-readonly"
+                disabled={isLoading}
+                onClick={async () => {
+                  setTab('login');
+                  setEmail('member.readonly@claritysql.internal');
+                  setPassword('ClarityUser2026!');
+                  setError(null);
+                  setIsLoading(true);
+                  try {
+                    await login('member.readonly@claritysql.internal', 'ClarityUser2026!');
+                  } catch (err: any) {
+                    setError(err.message || 'Demo login failed');
+                  } finally {
+                    setIsLoading(false);
+                  }
+                }}
+                className="p-2 rounded-xl bg-slate-50 dark:bg-slate-800/80 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 border border-slate-200 dark:border-slate-700 text-left transition-all group"
+              >
+                <div className="text-[11px] font-bold text-slate-900 dark:text-white group-hover:text-indigo-600 dark:group-hover:text-indigo-400">
+                  Jordan Lee
+                </div>
+                <div className="text-[10px] text-slate-500 dark:text-slate-400">
+                  Read-Only
+                </div>
+              </button>
+            </div>
+          </div>
         </div>
 
         {/* Security badge */}
