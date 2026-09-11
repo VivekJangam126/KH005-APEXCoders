@@ -15,6 +15,7 @@ import { HistoryView } from './components/history/HistoryView.tsx';
 import { AdminView } from './components/admin/AdminView.tsx';
 import { SettingsView } from './components/settings/SettingsView.tsx';
 import { MemberStatusScreen } from './components/auth/MemberStatusScreen.tsx';
+import { AcceptInviteView } from './components/auth/AcceptInviteView.tsx';
 import { Database } from 'lucide-react';
 
 function MainApp() {
@@ -50,6 +51,9 @@ function MainApp() {
   }
 
   if (!user) {
+    if (window.location.pathname === '/accept-invite') {
+      return <AcceptInviteView />;
+    }
     return <AuthView />;
   }
 

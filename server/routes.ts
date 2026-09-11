@@ -78,64 +78,7 @@ apiRouter.get('/health', async (req, res) => {
 // ----------------------------------------------------
 // Authentication Endpoints
 // ----------------------------------------------------
-apiRouter.post('/auth/register', async (req, res) => {
-  const { name, email, password } = req.body;
-  if (!name || !email || !password) {
-    return sendError(res, 400, 'INVALID_INPUT', 'Full name, email, and password are required.');
-  }
 
-  if (password.length < 8) {
-    return sendError(res, 400, 'WEAK_PASSWORD', 'Password must be at least 8 characters long.');
-  }
-
-  const normalizedEmail = email.trim().toLowerCase();
-  const db = await getDb();
-
-  try {
-    const existing = await db.query('SELECT id FROM clarity_app.users WHERE email = $1', [normalizedEmail]);
-    if (existing.rows.length > 0) {
-      return sendError(res, 409, 'EMAIL_EXISTS', 'An account with this email already exists.');
-    }
-
-    const userId = crypto.randomUUID();
-    const pwdHash = hashPassword(password);
-
-    await db.query(
-      `INSERT INTO clarity_app.users (id, name, email, password_hash)
-       VALUES ($1, $2, $3, $4)`,
-      [userId, name.trim(), normalizedEmail, pwdHash]
-    );
-
-    const token = await createSession(userId);
-
-    res.cookie(config.sessionCookieName, token, getSessionCookieOptions(req));
-
-    // Create welcome notification
-    await db.query(
-      `INSERT INTO clarity_app.notifications (id, owner_id, title, message, event_type)
-       VALUES ($1, $2, 'Account created.', 'Welcome to ClaritySQL! Load sample data or import your CSV to begin.', 'account_created')`,
-      [crypto.randomUUID(), userId]
-    );
-
-    // Auto-seed sample college dataset for instant exploration!
-    try {
-      await seedSampleCollegeDataset(userId);
-    } catch (seedErr) {
-      console.warn('Initial seed failed:', seedErr);
-    }
-
-    res.status(201).json({
-      user: {
-        id: userId,
-        name: name.trim(),
-        email: normalizedEmail,
-      },
-      token,
-    });
-  } catch (err: any) {
-    return sendError(res, 500, 'REGISTRATION_FAILED', err.message);
-  }
-});
 
 apiRouter.post('/auth/login', async (req, res) => {
   const { email, password } = req.body;
@@ -153,31 +96,6 @@ apiRouter.post('/auth/login', async (req, res) => {
     );
 
     if (userRes.rows.length === 0) {
-      if (normalizedEmail === 'demo@claritysql.internal') {
-        const demoId = 'demo-user-clarity-analyst';
-        const demoHash = hashPassword('Password123!');
-        await db.query(
-          `INSERT INTO clarity_app.users (id, name, email, password_hash)
-           VALUES ($1, $2, $3, $4)
-           ON CONFLICT (email) DO NOTHING`,
-          [demoId, 'Alex Morgan', normalizedEmail, demoHash]
-        );
-        try {
-          await seedSampleCollegeDataset(demoId);
-        } catch (e) {
-          console.warn('Demo dataset auto-seed error:', e);
-        }
-        const token = await createSession(demoId);
-        res.cookie(config.sessionCookieName, token, getSessionCookieOptions(req));
-        return res.json({
-          user: {
-            id: demoId,
-            name: 'Alex Morgan',
-            email: normalizedEmail,
-          },
-          token,
-        });
-      }
       return sendError(res, 401, 'INVALID_CREDENTIALS', 'Invalid email or password.');
     }
 
@@ -205,34 +123,7 @@ apiRouter.post('/auth/login', async (req, res) => {
   }
 });
 
-// Demo login supporting synthetic role personas
-apiRouter.post('/auth/demo', async (req, res) => {
-  const { email } = req.body;
-  const targetEmail = (email && typeof email === 'string' ? email.trim().toLowerCase() : 'admin@claritysql.internal');
 
-  const db = await getDb();
-  try {
-    const userRes = await db.query('SELECT id, name, email FROM clarity_app.users WHERE email = $1', [targetEmail]);
-    if (userRes.rows.length === 0) {
-      return sendError(res, 404, 'DEMO_USER_NOT_FOUND', `Demo identity for ${targetEmail} not found. Please refresh the page.`);
-    }
-
-    const user = userRes.rows[0];
-    const token = await createSession(user.id);
-    res.cookie(config.sessionCookieName, token, getSessionCookieOptions(req));
-
-    const fullUser = await getUserBySessionToken(token);
-
-    res.json({
-      success: true,
-      message: `Signed in as ${user.name}.`,
-      user: fullUser,
-      token,
-    });
-  } catch (err: any) {
-    return sendError(res, 500, 'DEMO_LOGIN_FAILED', err.message);
-  }
-});
 
 apiRouter.post('/auth/logout', requireAuth, async (req: AuthRequest, res) => {
   const token = req.cookies?.[config.sessionCookieName] ||
@@ -401,59 +292,95 @@ apiRouter.post('/datasets/seed-sample', requireAuth, async (req: AuthRequest, re
 // ----------------------------------------------------
 apiRouter.post('/uploads', requireAuth, upload.single('file'), async (req: AuthRequest, res) => {
   if (!req.file) {
-    return sendError(res, 400, 'NO_FILE', 'No CSV file was uploaded.');
+    return sendError(res, 400, 'NO_FILE', 'No file was uploaded.');
   }
 
-  const filename = req.file.originalname || 'data.csv';
+  // Restrict to ORG_ADMIN
+  if (req.user?.membership?.role !== 'ORG_ADMIN') {
+    return sendError(res, 403, 'FORBIDDEN', 'Only Organization Administrators can upload datasets.');
+  }
+
+  const filename = req.file.originalname || 'data.unknown';
+  const mimeType = req.file.mimetype || 'application/octet-stream';
+  const orgId = req.user?.organization?.id;
+
+  if (!orgId) {
+    return sendError(res, 400, 'NO_ORG', 'User does not belong to an organization.');
+  }
 
   try {
-    const parseResult = parseAndValidateCsv(req.file.buffer, filename);
-    const uploadId = crypto.randomUUID();
-    const expiresAt = new Date(Date.now() + 2 * 3600 * 1000).toISOString();
-    const db = await getDb();
+    const fs = await import('fs/promises');
+    const path = await import('path');
+    const os = await import('os');
+    const tempFilePath = path.join(os.tmpdir(), crypto.randomUUID() + path.extname(filename));
+    await fs.writeFile(tempFilePath, req.file.buffer);
 
+    const { DocumentIngestionAgent } = await import('./ingestion-agent.ts');
+    
+    const jobId = crypto.randomUUID();
+    const job = await DocumentIngestionAgent.processFile(
+      jobId,
+      orgId,
+      req.user!.id,
+      tempFilePath,
+      filename,
+      mimeType,
+      req.file.size
+    );
+
+    const db = await getDb();
+    
     await db.query(
-      `INSERT INTO clarity_app.uploads (
-         id, owner_id, original_filename, size_bytes, checksum,
-         status, stage, parsed_rows, parsed_columns, issues_json,
-         preview_rows_json, inferred_schema_json, staged_data_json, expires_at
-       ) VALUES ($1, $2, $3, $4, $5, 'staged', 'ready_to_import', $6, $7, $8, $9, $10, $11, $12)`,
+      `INSERT INTO clarity_app.ingestion_jobs (
+         id, organization_id, created_by, source_file_name, source_file_type,
+         source_file_size, source_hash, format, parser_version, extraction_status,
+         plan_hash, expires_at, raw_file_path, lifecycle_status,
+         source_coverage, candidate_tables, selected_tables, column_mappings, inferred_types, total_rows_per_table, issues, transformations, source_references, proposed_relationships
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
       [
-        uploadId,
-        req.user!.id,
-        filename,
-        req.file.size,
-        parseResult.checksum,
-        parseResult.totalRows,
-        parseResult.totalColumns,
-        JSON.stringify(parseResult.issues),
-        JSON.stringify(parseResult.previewRows),
-        JSON.stringify(parseResult.columns),
-        JSON.stringify(parseResult.allRows),
-        expiresAt,
+        job.jobId, job.organizationId, job.createdBy, job.sourceFileName, job.sourceFileType,
+        job.sourceFileSize, job.sourceHash, job.format, job.parserVersion, job.extractionStatus,
+        job.planHash, job.expiresAt, job.rawFilePath, job.lifecycleStatus,
+        JSON.stringify(job.sourceCoverage), JSON.stringify(job.candidateTables), JSON.stringify(job.selectedTables), JSON.stringify(job.columnMappings), JSON.stringify(job.inferredTypes), JSON.stringify(job.totalRowsPerTable), JSON.stringify(job.issues), JSON.stringify(job.transformations), JSON.stringify(job.sourceReferences), JSON.stringify(job.proposedRelationships)
       ]
     );
 
+    for (const table of job.candidateTables) {
+      for (let i = 0; i < table.rows.length; i++) {
+        await db.query(
+          `INSERT INTO clarity_app.staged_rows (id, job_id, table_name, row_index, data_json)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [crypto.randomUUID(), job.jobId, table.name, i, JSON.stringify(table.rows[i])]
+        );
+      }
+    }
+    
+    // Provide a backwards-compatible response for the legacy UI
+    const legacyColumns = job.candidateTables.length > 0 ? job.candidateTables[0].columns : [];
+    const legacyPreview = job.candidateTables.length > 0 ? job.candidateTables[0].rows.slice(0, 100) : [];
+    
     res.status(201).json({
-      uploadId,
+      uploadId: job.jobId, // Mapped to jobId
       originalFilename: filename,
       sizeBytes: req.file.size,
-      checksum: parseResult.checksum,
-      totalRows: parseResult.totalRows,
-      totalColumns: parseResult.totalColumns,
-      columns: parseResult.columns,
-      previewRows: parseResult.previewRows,
-      issues: parseResult.issues,
+      checksum: job.sourceHash,
+      totalRows: job.candidateTables.length > 0 ? job.candidateTables[0].rowCount : 0,
+      totalColumns: legacyColumns.length,
+      columns: legacyColumns,
+      previewRows: legacyPreview,
+      issues: job.issues,
+      extractionStatus: job.extractionStatus,
+      candidateTables: job.candidateTables
     });
   } catch (err: any) {
-    return sendError(res, 400, 'CSV_VALIDATION_FAILED', err.message);
+    return sendError(res, 500, 'INGESTION_FAILED', err.message);
   }
 });
 
 apiRouter.get('/uploads/:id', requireAuth, async (req: AuthRequest, res) => {
   const db = await getDb();
   const resUpload = await db.query(
-    'SELECT * FROM clarity_app.uploads WHERE id = $1 AND owner_id = $2',
+    'SELECT * FROM clarity_app.ingestion_jobs WHERE id = $1 AND created_by = $2',
     [req.params.id, req.user!.id]
   );
 
@@ -462,26 +389,31 @@ apiRouter.get('/uploads/:id', requireAuth, async (req: AuthRequest, res) => {
   }
 
   const u = resUpload.rows[0];
+  const candidateTables = JSON.parse(u.candidate_tables || '[]');
+  const legacyColumns = candidateTables.length > 0 ? candidateTables[0].columns : [];
+  const legacyPreview = candidateTables.length > 0 ? candidateTables[0].rows.slice(0, 100) : [];
+  
   res.json({
     id: u.id,
-    originalFilename: u.original_filename,
-    sizeBytes: Number(u.size_bytes),
-    checksum: u.checksum,
-    status: u.status,
-    stage: u.stage,
-    totalRows: u.parsed_rows,
-    totalColumns: u.parsed_columns,
-    columns: JSON.parse(u.inferred_schema_json || '[]'),
-    previewRows: JSON.parse(u.preview_rows_json || '[]'),
-    issues: JSON.parse(u.issues_json || '[]'),
-    errorMessage: u.error_message,
+    originalFilename: u.source_file_name,
+    sizeBytes: Number(u.source_file_size),
+    checksum: u.source_hash,
+    status: u.extraction_status,
+    stage: u.lifecycle_status,
+    totalRows: candidateTables.length > 0 ? candidateTables[0].rowCount : 0,
+    totalColumns: legacyColumns.length,
+    columns: legacyColumns,
+    previewRows: legacyPreview,
+    issues: JSON.parse(u.issues || '[]'),
+    extractionStatus: u.extraction_status,
+    candidateTables: candidateTables
   });
 });
 
 apiRouter.delete('/uploads/:id', requireAuth, async (req: AuthRequest, res) => {
   const db = await getDb();
   await db.query(
-    'DELETE FROM clarity_app.uploads WHERE id = $1 AND owner_id = $2',
+    'DELETE FROM clarity_app.ingestion_jobs WHERE id = $1 AND created_by = $2',
     [req.params.id, req.user!.id]
   );
   res.json({ success: true, message: 'Upload draft discarded safely.' });
@@ -496,9 +428,14 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
     return sendError(res, 400, 'INVALID_INPUT', 'uploadId is required.');
   }
 
+  // Restrict to ORG_ADMIN
+  if (req.user?.membership?.role !== 'ORG_ADMIN') {
+    return sendError(res, 403, 'FORBIDDEN', 'Only Organization Administrators can import datasets.');
+  }
+
   const db = await getDb();
   const uploadRes = await db.query(
-    'SELECT * FROM clarity_app.uploads WHERE id = $1 AND owner_id = $2',
+    'SELECT * FROM clarity_app.ingestion_jobs WHERE id = $1 AND created_by = $2',
     [uploadId, req.user!.id]
   );
 
@@ -507,11 +444,25 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
   }
 
   const upload = uploadRes.rows[0];
-  const columns = JSON.parse(upload.inferred_schema_json || '[]');
-  const allRows = JSON.parse(upload.staged_data_json || '[]');
+  const candidateTables = JSON.parse(upload.candidate_tables || '[]');
+  
+  if (candidateTables.length === 0) {
+    return sendError(res, 400, 'NO_DATA', 'No tabular data was found to import.');
+  }
 
-  const finalDatasetName = datasetName?.trim() || upload.original_filename.replace(/\.[^/.]+$/, '');
-  const rawTableName = tableName?.trim() || upload.original_filename.replace(/\.[^/.]+$/, '');
+  // Use the first table for now in legacy support
+  const tableData = candidateTables[0];
+  const columns = tableData.columns;
+  
+  // Fetch rows from staged_rows
+  const stagedRowsRes = await db.query(
+    'SELECT data_json FROM clarity_app.staged_rows WHERE job_id = $1 AND table_name = $2 ORDER BY row_index ASC',
+    [uploadId, tableData.name]
+  );
+  const allRows = stagedRowsRes.rows.map(r => r.data_json);
+
+  const finalDatasetName = datasetName?.trim() || upload.source_file_name.replace(/\.[^/.]+$/, '');
+  const rawTableName = tableName?.trim() || tableData.name;
   const finalTableName = sanitizeIdentifier(rawTableName);
 
   const datasetId = crypto.randomUUID();
@@ -551,11 +502,13 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
 
     // 5. Mark upload completed and free staging memory
     await db.query(
-      `UPDATE clarity_app.uploads
-       SET status = 'completed', stage = 'imported', staged_data_json = NULL
+      `UPDATE clarity_app.ingestion_jobs
+       SET extraction_status = 'COMPLETED', lifecycle_status = 'confirmed', confirmed_at = CURRENT_TIMESTAMP, created_database_id = $2
        WHERE id = $1`,
-      [uploadId]
+      [uploadId, datasetId]
     );
+
+    await db.query(`DELETE FROM clarity_app.staged_rows WHERE job_id = $1`, [uploadId]);
 
     // 6. Log audit event
     if (req.user?.organization?.id) {
@@ -573,7 +526,7 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
       });
     }
 
-    // 6. Notification
+    // 7. Notification
     await db.query(
       `INSERT INTO clarity_app.notifications (id, owner_id, title, message, event_type, related_entity_type, related_entity_id)
        VALUES ($1, $2, 'Your database is ready.', $3, 'dataset_ready', 'dataset', $4)`,

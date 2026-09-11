@@ -68,10 +68,11 @@ async function request<T = any>(
 
 export const api = {
   auth: {
-    async register(name: string, email: string, password: string): Promise<{ user: User; token: string }> {
-      const data = await request('/auth/register', {
+    async registerOrg(name: string, email: string, password: string, orgName: string): Promise<{ user: User; token: string }> {
+      const orgHandle = orgName.toLowerCase().replace(/[^a-z0-9-]/g, '-') + '-' + Math.floor(Math.random() * 10000);
+      const data = await request('/auth/register-org', {
         method: 'POST',
-        body: JSON.stringify({ name, email, password }),
+        body: JSON.stringify({ adminName: name, email, password, orgName, orgHandle }),
       });
       setStoredToken(data.token);
       return data;
@@ -84,14 +85,7 @@ export const api = {
       setStoredToken(data.token);
       return data;
     },
-    async loginDemo(email?: string): Promise<{ user: User; token: string }> {
-      const data = await request('/auth/demo', {
-        method: 'POST',
-        body: JSON.stringify({ email }),
-      });
-      setStoredToken(data.token);
-      return data;
-    },
+
     async logout(): Promise<void> {
       try {
         await request('/auth/logout', { method: 'POST' });
@@ -255,9 +249,28 @@ export const api = {
       const params = new URLSearchParams();
       if (filters?.action) params.set('action', filters.action);
       if (filters?.search) params.set('search', filters.search);
-      if (filters?.limit) params.set('limit', String(filters.limit));
-      if (filters?.offset) params.set('offset', String(filters.offset));
-      return request(`/admin/organizations/${orgId}/audit-logs?${params.toString()}`);
+      if (filters?.limit) params.set('limit', filters.limit.toString());
+      if (filters?.offset) params.set('offset', filters.offset.toString());
+      return request(`/admin/audit-logs/${orgId}?${params.toString()}`);
+    },
+    // Admin-controlled user management
+    async createUser(data: { name: string; email: string; password: string; permissionLevel: 'READ_ONLY' | 'READ_WRITE' }): Promise<{ success: boolean; user: any }> {
+      return request('/admin/users', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      });
+    },
+    async listUsers(): Promise<{ users: any[] }> {
+      return request('/admin/users');
+    },
+    async updateUserPermissions(userId: string, permissionLevel: 'READ_ONLY' | 'READ_WRITE'): Promise<{ success: boolean; message: string }> {
+      return request(`/admin/users/${userId}/permissions`, {
+        method: 'PATCH',
+        body: JSON.stringify({ permissionLevel }),
+      });
+    },
+    async deleteUser(userId: string): Promise<{ success: boolean; message: string }> {
+      return request(`/admin/users/${userId}`, { method: 'DELETE' });
     },
     async updateMemberStatus(membershipId: string, status: string, rejectionReason?: string): Promise<any> {
       return request(`/admin/memberships/${membershipId}/status`, {

@@ -62,6 +62,14 @@ export function AdminView() {
     canExport: true,
   });
 
+  // Create user state
+  const [newUserName, setNewUserName] = useState('');
+  const [newUserEmail, setNewUserEmail] = useState('');
+  const [newUserPassword, setNewUserPassword] = useState('');
+  const [newUserPermission, setNewUserPermission] = useState<'READ_ONLY' | 'READ_WRITE'>('READ_ONLY');
+  const [isCreatingUser, setIsCreatingUser] = useState(false);
+  const [membersList, setMembersList] = useState<any[]>([]);
+
   // Audit filter state
   const [auditActionFilter, setAuditActionFilter] = useState('');
   const [auditSearch, setAuditSearch] = useState('');
@@ -106,7 +114,9 @@ export function AdminView() {
 
   useEffect(() => {
     loadOrgData();
+    loadMembersList();
   }, [orgId, auditActionFilter]);
+
 
   // Update permissions state when member or dataset changes
   useEffect(() => {
@@ -164,25 +174,80 @@ export function AdminView() {
   };
 
   // Handle Org update
-  const handleUpdateOrg = async (e: React.FormEvent) => {
+  const handleRenameOrg = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newOrgName.trim()) return;
     setIsUpdatingOrg(true);
     setFeedback(null);
     try {
       await api.admin.updateOrganization(orgId!, { name: newOrgName.trim() });
-      setFeedback({ type: 'success', message: 'Organization name updated.' });
-      await refreshUser();
-      await loadOrgData();
+      setFeedback({ type: 'success', message: 'Organization name updated successfully.' });
+      loadOrgData();
+      refreshUser();
     } catch (err: any) {
-      setFeedback({ type: 'error', message: err.message || 'Failed to update organization' });
+      setFeedback({ type: 'error', message: err.message || 'Failed to update organization name.' });
     } finally {
       setIsUpdatingOrg(false);
     }
   };
 
+  const handleCreateUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newUserName.trim() || !newUserEmail.trim() || !newUserPassword.trim()) return;
+    setIsCreatingUser(true);
+    setFeedback(null);
+    try {
+      await api.admin.createUser({
+        name: newUserName.trim(),
+        email: newUserEmail.trim(),
+        password: newUserPassword,
+        permissionLevel: newUserPermission,
+      });
+      setFeedback({ type: 'success', message: `User "${newUserName.trim()}" created successfully.` });
+      setNewUserName('');
+      setNewUserEmail('');
+      setNewUserPassword('');
+      await loadMembersList();
+    } catch (err: any) {
+      setFeedback({ type: 'error', message: err.message || 'Failed to create user.' });
+    } finally {
+      setIsCreatingUser(false);
+    }
+  };
+
+  const handleDeleteUser = async (userId: string, userName: string) => {
+    if (!window.confirm(`Remove user "${userName}" from the organisation? This cannot be undone.`)) return;
+    setFeedback(null);
+    try {
+      await api.admin.deleteUser(userId);
+      setFeedback({ type: 'success', message: `User "${userName}" removed.` });
+      await loadMembersList();
+    } catch (err: any) {
+      setFeedback({ type: 'error', message: err.message || 'Failed to remove user.' });
+    }
+  };
+
+  const handleChangePermission = async (userId: string, permissionLevel: 'READ_ONLY' | 'READ_WRITE') => {
+    setFeedback(null);
+    try {
+      await api.admin.updateUserPermissions(userId, permissionLevel);
+      setFeedback({ type: 'success', message: 'Permission level updated.' });
+      await loadMembersList();
+    } catch (err: any) {
+      setFeedback({ type: 'error', message: err.message || 'Failed to update permissions.' });
+    }
+  };
+
+  const loadMembersList = async () => {
+    try {
+      const res = await api.admin.listUsers();
+      setMembersList(res.users || []);
+    } catch {}
+  };
+
   const pendingRequests = orgDetails?.members?.filter((m: any) => m.status === 'PENDING') || [];
   const activeMembers = orgDetails?.members?.filter((m: any) => m.status !== 'PENDING') || [];
+
 
   return (
     <div className="max-w-6xl mx-auto space-y-6 select-none">
@@ -430,43 +495,105 @@ export function AdminView() {
       {/* Tab 2: Members & Roles */}
       {activeTab === 'members' && (
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-sm overflow-hidden">
-          <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
-            <div>
-              <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-                Organization Members Directory
-              </h3>
-              <p className="text-xs text-slate-500">
-                Manage roles, suspend accounts, and configure active user state
-              </p>
+          <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex flex-col gap-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                  Organization Members Directory
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Manage roles, suspend accounts, and configure active user state
+                </p>
+              </div>
+              <span className="text-xs text-slate-400 font-mono">
+                {activeMembers.length} members
+              </span>
             </div>
-            <span className="text-xs text-slate-400 font-mono">
-              {activeMembers.length} members
-            </span>
+
+            {/* Create User Form */}
+            <form onSubmit={handleCreateUser} className="bg-slate-50 dark:bg-slate-800/40 p-4 rounded-lg border border-slate-100 dark:border-slate-800 space-y-3">
+              <div className="text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">Create New User</div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1 block">Full Name</label>
+                  <input
+                    type="text"
+                    value={newUserName}
+                    onChange={e => setNewUserName(e.target.value)}
+                    placeholder="Jane Smith"
+                    required
+                    className="w-full text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1 block">Email Address</label>
+                  <input
+                    type="email"
+                    value={newUserEmail}
+                    onChange={e => setNewUserEmail(e.target.value)}
+                    placeholder="jane@company.com"
+                    required
+                    className="w-full text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1 block">Password (min 8 chars)</label>
+                  <input
+                    type="password"
+                    value={newUserPassword}
+                    onChange={e => setNewUserPassword(e.target.value)}
+                    placeholder="••••••••"
+                    minLength={8}
+                    required
+                    className="w-full text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1 block">Permission Level</label>
+                  <select
+                    value={newUserPermission}
+                    onChange={e => setNewUserPermission(e.target.value as 'READ_ONLY' | 'READ_WRITE')}
+                    className="w-full text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"
+                  >
+                    <option value="READ_ONLY">Read Only — can query & export</option>
+                    <option value="READ_WRITE">Read & Write — can upload & modify records</option>
+                  </select>
+                </div>
+              </div>
+              <div className="flex justify-end pt-1">
+                <button
+                  type="submit"
+                  disabled={isCreatingUser || !newUserName.trim() || !newUserEmail.trim() || !newUserPassword.trim()}
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>{isCreatingUser ? 'Creating...' : 'Create User'}</span>
+                </button>
+              </div>
+            </form>
           </div>
 
+          {/* Members Table */}
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-750 text-slate-500">
                 <tr>
                   <th className="px-4 py-3 font-semibold">User</th>
                   <th className="px-4 py-3 font-semibold">Role</th>
-                  <th className="px-4 py-3 font-semibold">Membership Status</th>
-                  <th className="px-4 py-3 font-semibold">Joined / Approved</th>
+                  <th className="px-4 py-3 font-semibold">Permission Level</th>
                   <th className="px-4 py-3 font-semibold text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-slate-700 dark:text-slate-300">
-                {activeMembers.map((m: any) => {
-                  const isCurrent = m.userId === user?.id;
-                  const isSuspended = m.status === 'SUSPENDED';
-
+                {membersList.map((m: any) => {
+                  const isCurrent = m.id === user?.id;
                   return (
                     <tr key={m.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-850/50">
                       <td className="px-4 py-3">
                         <div className="font-semibold text-slate-900 dark:text-white">
-                          {m.userName} {isCurrent && <span className="text-[10px] text-purple-600 font-normal">(You)</span>}
+                          {m.name} {isCurrent && <span className="text-[10px] text-purple-600 font-normal">(You)</span>}
                         </div>
-                        <div className="text-[11px] text-slate-400">{m.userEmail}</div>
+                        <div className="text-[11px] text-slate-400">{m.email}</div>
                       </td>
                       <td className="px-4 py-3">
                         <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
@@ -474,70 +601,53 @@ export function AdminView() {
                             ? 'bg-purple-100 text-purple-700 dark:bg-purple-950 dark:text-purple-300 border-purple-200 dark:border-purple-800'
                             : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300 border-slate-200 dark:border-slate-700'
                         }`}>
-                          {m.role}
+                          {m.role === 'ORG_ADMIN' ? 'Admin' : 'Member'}
                         </span>
                       </td>
                       <td className="px-4 py-3">
-                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
-                          m.status === 'APPROVED'
-                            ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
-                            : m.status === 'SUSPENDED'
-                            ? 'bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300 border-rose-200 dark:border-rose-800'
-                            : 'bg-slate-100 text-slate-600 border-slate-200'
-                        }`}>
-                          {m.status}
-                        </span>
-                        {m.rejectionReason && (
-                          <p className="text-[10px] text-slate-400 italic mt-0.5">"{m.rejectionReason}"</p>
+                        {m.role === 'ORG_ADMIN' ? (
+                          <span className="text-[11px] text-slate-400 italic">Full Access</span>
+                        ) : (
+                          <select
+                            value={m.permission_level || 'READ_ONLY'}
+                            onChange={e => handleChangePermission(m.id, e.target.value as 'READ_ONLY' | 'READ_WRITE')}
+                            className="text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded px-2 py-1 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"
+                          >
+                            <option value="READ_ONLY">Read Only</option>
+                            <option value="READ_WRITE">Read & Write</option>
+                          </select>
                         )}
-                      </td>
-                      <td className="px-4 py-3 text-slate-400 text-[11px]">
-                        {m.approvedAt ? new Date(m.approvedAt).toLocaleDateString() : 'N/A'}
                       </td>
                       <td className="px-4 py-3 text-right">
-                        {!isCurrent && (
-                          <div className="flex items-center justify-end gap-1.5">
-                            {isSuspended ? (
-                              <button
-                                id={`reactivate-member-${m.id}-btn`}
-                                onClick={() => handleStatusChange(m.id, 'APPROVED')}
-                                className="px-2.5 py-1 rounded bg-slate-100 dark:bg-slate-800 hover:bg-emerald-100 text-slate-700 hover:text-emerald-700 text-[11px] font-medium transition-colors"
-                              >
-                                Reactivate
-                              </button>
-                            ) : (
-                              <button
-                                id={`suspend-member-${m.id}-btn`}
-                                onClick={() => handleStatusChange(m.id, 'SUSPENDED')}
-                                className="px-2.5 py-1 rounded bg-slate-100 dark:bg-slate-800 hover:bg-rose-100 text-slate-700 hover:text-rose-700 text-[11px] font-medium transition-colors"
-                              >
-                                Suspend
-                              </button>
-                            )}
-
-                            <button
-                              id={`remove-member-${m.id}-btn`}
-                              onClick={() => {
-                                if (confirm(`Remove ${m.userName} from this organization?`)) {
-                                  handleStatusChange(m.id, 'REJECTED', 'Removed by administrator');
-                                }
-                              }}
-                              className="p-1 rounded text-slate-400 hover:text-rose-600 transition-colors"
-                              title="Remove member"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
+                        {!isCurrent && m.role !== 'ORG_ADMIN' && (
+                          <button
+                            onClick={() => handleDeleteUser(m.id, m.name)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-400 hover:bg-rose-100 dark:hover:bg-rose-900/50 border border-rose-200 dark:border-rose-800 transition-colors"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            Remove
+                          </button>
                         )}
+                        {isCurrent && <span className="text-[11px] text-slate-400 italic">—</span>}
                       </td>
                     </tr>
                   );
                 })}
+                {membersList.length === 0 && (
+                  <tr>
+                    <td colSpan={4} className="px-4 py-8 text-center text-slate-400 text-xs">
+                      No members yet. Create your first user above.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
         </div>
       )}
+
+
+
 
       {/* Tab 3: Database Permissions Matrix */}
       {activeTab === 'permissions' && (

@@ -8,7 +8,7 @@ import {
   ConnectionHealthStatus,
   categorizeConnectionError,
 } from './db-config-resolver.ts';
-import { seedDemoOrganizationsAndUsers } from './demo-seed.ts';
+
 
 const { Pool } = pg;
 
@@ -127,12 +127,19 @@ export async function getDb(): Promise<DatabaseAdapter> {
     try {
       console.log(`[Database] Connecting to PostgreSQL via resolved source: ${resolved.appSourceVar}...`);
       
-      pgAppPool = new Pool({
+      const poolOptions: any = {
         connectionString: resolved.appDatabaseUrl,
         max: 15,
         idleTimeoutMillis: 30000,
         connectionTimeoutMillis: 8000,
-      });
+      };
+
+      if (!resolved.appDatabaseUrl.includes('localhost') && !resolved.appDatabaseUrl.includes('127.0.0.1')) {
+        poolOptions.ssl = { rejectUnauthorized: false };
+      }
+
+      pgAppPool = new Pool(poolOptions);
+
 
       // Verify connection and database identity
       const verifyRes = await pgAppPool.query('SELECT current_database() as db, current_user as usr, version() as ver');
@@ -146,12 +153,16 @@ export async function getDb(): Promise<DatabaseAdapter> {
       if (resolved.analyticsReadDatabaseUrl && resolved.analyticsReadDatabaseUrl !== resolved.appDatabaseUrl) {
         try {
           console.log(`[Database] Initializing dedicated analytics read pool via ${resolved.analyticsReadSourceVar}...`);
-          pgAnalyticsReadPool = new Pool({
+          const readPoolOptions: any = {
             connectionString: resolved.analyticsReadDatabaseUrl,
             max: 15,
             idleTimeoutMillis: 30000,
             connectionTimeoutMillis: 8000,
-          });
+          };
+          if (!resolved.analyticsReadDatabaseUrl.includes('localhost') && !resolved.analyticsReadDatabaseUrl.includes('127.0.0.1')) {
+            readPoolOptions.ssl = { rejectUnauthorized: false };
+          }
+          pgAnalyticsReadPool = new Pool(readPoolOptions);
           await pgAnalyticsReadPool.query('SELECT 1');
           analyticsReadDbInstance = new PgPoolAdapter(pgAnalyticsReadPool, 'PostgreSQL (Analytics Read Pool)');
           console.log('[Database] Dedicated analytics read pool initialized.');
@@ -199,31 +210,9 @@ export async function getDb(): Promise<DatabaseAdapter> {
     }
   }
 
-  // Fallback ONLY when no external database URL has been configured at all
-  console.log('[Database] No external PostgreSQL URL configured. Bootstrapping embedded PGlite for local development...');
-  if (!fs.existsSync(config.pgDataDir)) {
-    fs.mkdirSync(config.pgDataDir, { recursive: true });
-  }
-
-  pgliteInstance = new PGlite(config.pgDataDir);
-  await pgliteInstance.waitReady;
-  appDbInstance = new PgliteAdapter(pgliteInstance);
-  analyticsReadDbInstance = appDbInstance;
-
-  lastHealthCheck = {
-    status: 'needs_setup',
-    engine: 'PostgreSQL (PGlite embedded)',
-    sourceVar: null,
-    databaseName: 'pgdata_embedded',
-    currentUser: 'postgres_local',
-    latencyMs: 1,
-    readPoolConfigured: false,
-    readPoolSourceVar: null,
-    lastCheckedAt: new Date().toISOString(),
-  };
-
-  await initMigrations(appDbInstance);
-  return appDbInstance;
+  // Fatal error if no external database URL has been configured at all
+  console.error('[Database] No external PostgreSQL URL configured. A live PostgreSQL connection is required.');
+  throw new Error('Database connection failed: DATABASE_URL is not configured.');
 }
 
 /**
@@ -368,6 +357,15 @@ export async function initMigrations(db: DatabaseAdapter) {
     CREATE TABLE IF NOT EXISTS clarity_app.sessions (
       token_hash TEXT PRIMARY KEY,
       user_id TEXT NOT NULL REFERENCES clarity_app.users(id) ON DELETE CASCADE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS clarity_app.invites (
+      token_hash TEXT PRIMARY KEY,
+      organization_id TEXT NOT NULL REFERENCES clarity_app.organizations(id) ON DELETE CASCADE,
+      email TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'MEMBER',
       expires_at TIMESTAMPTZ NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -600,7 +598,26 @@ export async function initMigrations(db: DatabaseAdapter) {
       is_excluded BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+  `);
 
+  // Ensure columns exist on datasets table before creating indexes
+  try {
+    await db.exec(`
+      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS access_policy TEXT DEFAULT 'ALL_MEMBERS';
+      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS organization_id TEXT;
+      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS created_by TEXT;
+      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS updated_by TEXT;
+      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS description TEXT;
+      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS lifecycle_state TEXT DEFAULT 'active';
+      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS schema_revision INTEGER DEFAULT 1;
+      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS data_revision INTEGER DEFAULT 1;
+      ALTER TABLE clarity_app.users ADD COLUMN IF NOT EXISTS account_state TEXT DEFAULT 'active';
+    `);
+  } catch (err) {
+    // Ignore if unsupported or already added
+  }
+
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_staged_rows_job_table ON clarity_app.staged_rows(job_id, table_name, row_index);
     CREATE INDEX IF NOT EXISTS idx_ingestion_jobs_org ON clarity_app.ingestion_jobs(organization_id, lifecycle_status);
 
@@ -618,28 +635,9 @@ export async function initMigrations(db: DatabaseAdapter) {
     CREATE INDEX IF NOT EXISTS idx_notifications_owner ON clarity_app.notifications(owner_id, is_read);
   `);
 
-  // Ensure columns exist on datasets table if previously created
-  try {
-    await db.exec(`
-      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS access_policy TEXT DEFAULT 'ALL_MEMBERS';
-      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS organization_id TEXT;
-      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS created_by TEXT;
-      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS updated_by TEXT;
-      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS description TEXT;
-      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS lifecycle_state TEXT DEFAULT 'active';
-      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS schema_revision INTEGER DEFAULT 1;
-      ALTER TABLE clarity_app.datasets ADD COLUMN IF NOT EXISTS data_revision INTEGER DEFAULT 1;
-      ALTER TABLE clarity_app.users ADD COLUMN IF NOT EXISTS account_state TEXT DEFAULT 'active';
-    `);
-  } catch (err) {
-    // Ignore if unsupported or already added
-  }
-
   // Migrate legacy records: ensure all users and datasets belong to an organization
   await migrateLegacyData(db);
 
-  // Initialize synthetic demo personas and organizations for demo mode
-  await seedDemoOrganizationsAndUsers();
 
   console.log('[Migrations] Database migrations completed successfully.');
 }

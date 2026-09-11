@@ -6,8 +6,7 @@ interface AuthContextType {
   user: User | null;
   isLoading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  loginDemo: (email?: string) => Promise<void>;
-  register: (name: string, email: string, password: string) => Promise<void>;
+  registerOrg: (name: string, email: string, password: string, orgName: string) => Promise<void>;
   logout: () => Promise<void>;
   updateProfile: (name: string) => Promise<void>;
   refreshUser: () => Promise<void>;
@@ -39,13 +38,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(data.user);
   };
 
-  const loginDemo = async (email?: string) => {
-    const data = await api.auth.loginDemo(email);
-    setUser(data.user);
-  };
-
-  const register = async (name: string, email: string, password: string) => {
-    const data = await api.auth.register(name, email, password);
+  const registerOrg = async (name: string, email: string, password: string, orgName: string) => {
+    const data = await api.auth.registerOrg(name, email, password, orgName);
     setUser(data.user);
   };
 
@@ -68,8 +62,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         user,
         isLoading,
         login,
-        loginDemo,
-        register,
+        registerOrg,
         logout,
         updateProfile,
         refreshUser,

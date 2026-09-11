@@ -3,10 +3,11 @@ import { useAuth } from '../../context/AuthContext.tsx';
 import { Database, ShieldCheck, Lock, Mail, User as UserIcon, ArrowRight, Sparkles } from 'lucide-react';
 
 export function AuthView() {
-  const { login, register, demoLogin } = useAuth();
+  const { login, registerOrg } = useAuth();
   const [tab, setTab] = useState<'login' | 'register'>('login');
 
   const [name, setName] = useState('');
+  const [orgName, setOrgName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
 
@@ -17,9 +18,15 @@ export function AuthView() {
     e.preventDefault();
     setError(null);
 
-    if (tab === 'register' && name.trim().length < 2) {
-      setError('Please enter a valid name (at least 2 characters).');
-      return;
+    if (tab === 'register') {
+      if (name.trim().length < 2) {
+        setError('Please enter a valid name (at least 2 characters).');
+        return;
+      }
+      if (orgName.trim().length < 2) {
+        setError('Please enter a valid organization name.');
+        return;
+      }
     }
 
     if (!email.includes('@') || !email.includes('.')) {
@@ -35,7 +42,7 @@ export function AuthView() {
     setIsLoading(true);
     try {
       if (tab === 'register') {
-        await register(name.trim(), email.trim(), password);
+        await registerOrg(name.trim(), email.trim(), password, orgName.trim());
       } else {
         await login(email.trim(), password);
       }
@@ -47,17 +54,6 @@ export function AuthView() {
     }
   };
 
-  const handleDemoLogin = async () => {
-    setIsLoading(true);
-    setError(null);
-    try {
-      await demoLogin();
-    } catch (err: any) {
-      setError(err.message || 'Failed to login with demo account');
-    } finally {
-      setIsLoading(false);
-    }
-  };
 
   return (
     <div className="min-h-screen bg-[#F5F7FB] dark:bg-slate-950 flex flex-col justify-center items-center p-4 sm:p-6">
@@ -120,21 +116,40 @@ export function AuthView() {
           {/* Form */}
           <form onSubmit={handleSubmit} className="space-y-4">
             {tab === 'register' && (
-              <div>
-                <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block mb-1">
-                  Full Name
-                </label>
-                <div className="relative">
-                  <UserIcon className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                  <input
-                    type="text"
-                    id="register-name-input"
-                    placeholder="e.g. Alex Morgan"
-                    value={name}
-                    onChange={e => setName(e.target.value)}
-                    required
-                    className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl pl-9 pr-3 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"
-                  />
+              <div className="space-y-4">
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block mb-1">
+                    Full Name
+                  </label>
+                  <div className="relative">
+                    <UserIcon className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="text"
+                      id="register-name-input"
+                      placeholder="e.g. Alex Morgan"
+                      value={name}
+                      onChange={e => setName(e.target.value)}
+                      required
+                      className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl pl-9 pr-3 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block mb-1">
+                    Organization Name
+                  </label>
+                  <div className="relative">
+                    <ShieldCheck className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="text"
+                      id="register-org-input"
+                      placeholder="e.g. Acme Corp"
+                      value={orgName}
+                      onChange={e => setOrgName(e.target.value)}
+                      required
+                      className="w-full text-xs bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl pl-9 pr-3 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
                 </div>
               </div>
             )}
@@ -195,19 +210,7 @@ export function AuthView() {
             </button>
           </form>
 
-          {/* Quick Demo Login Option */}
-          <div className="pt-3 border-t border-slate-100 dark:border-slate-800">
-            <button
-              type="button"
-              id="demo-login-btn"
-              onClick={handleDemoLogin}
-              disabled={isLoading}
-              className="w-full py-2 px-3 rounded-xl border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs font-medium flex items-center justify-center gap-2 transition-colors"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
-              <span>One-Click Demo Analyst Access</span>
-            </button>
-          </div>
+
         </div>
 
         {/* Security badge */}

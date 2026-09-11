@@ -51,8 +51,10 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
   };
 
   const processFile = async (f: File) => {
-    if (!f.name.toLowerCase().endsWith('.csv')) {
-      setError('Please upload a valid .csv file.');
+    const allowed = ['.csv', '.tsv', '.xlsx', '.xls', '.json', '.jsonl', '.txt', '.md', '.pdf', '.docx', '.png', '.jpg', '.jpeg', '.webp'];
+    const ext = f.name.toLowerCase().substring(f.name.lastIndexOf('.'));
+    if (!allowed.includes(ext) && !f.name.toLowerCase().endsWith('.csv')) {
+      setError('Please upload a supported dataset or document file.');
       return;
     }
     setFile(f);
@@ -138,7 +140,14 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
           )}
 
           {step === 'upload' && (
-            <div className="space-y-4">
+            <div className="space-y-6">
+              <div>
+                <h3 className="text-xl font-bold text-slate-900 dark:text-white mb-1">Import Data</h3>
+                <p className="text-slate-500 dark:text-slate-400 text-sm">
+                  Select a dataset file (CSV, Excel, JSON, PDF, etc.) to ingest and analyze.
+                </p>
+              </div>
+
               {/* Drag and Drop Zone */}
               <div
                 onDragOver={e => {
@@ -158,7 +167,7 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
                   type="file"
                   ref={fileInputRef}
                   onChange={handleFileSelect}
-                  accept=".csv"
+                  accept=".csv,.tsv,.xlsx,.xls,.json,.jsonl,.txt,.md,.pdf,.docx,.png,.jpg,.jpeg,.webp"
                   className="hidden"
                 />
 

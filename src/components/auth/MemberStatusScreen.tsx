@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext.tsx';
-import { PersonaSwitcher } from '../common/PersonaSwitcher.tsx';
+
 import {
   Clock,
   Ban,
@@ -65,15 +65,6 @@ export function MemberStatusScreen() {
 
   return (
     <div className="min-h-screen w-full bg-[#F5F7FB] dark:bg-slate-950 flex flex-col items-center justify-center p-4 sm:p-6 text-slate-800 dark:text-slate-100">
-      {/* Top Banner with Persona Switcher */}
-      <div className="w-full max-w-xl mb-4 flex items-center justify-between bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-2.5 shadow-sm">
-        <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-          <ShieldCheck className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
-          <span className="font-semibold text-slate-700 dark:text-slate-300">RBAC Demo Mode:</span>
-          <span>Switch persona to approve this request</span>
-        </div>
-        <PersonaSwitcher compact />
-      </div>
 
       <div className="w-full max-w-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-xl p-6 sm:p-8">
         <div className="flex items-center justify-between pb-6 border-b border-slate-100 dark:border-slate-800">

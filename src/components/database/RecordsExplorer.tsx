@@ -710,7 +710,7 @@ export function RecordsExplorer({
 
             <div className="flex items-center justify-between pt-2">
               <label className="cursor-pointer text-xs font-medium text-indigo-600 hover:text-indigo-700">
-                <span>Upload CSV File</span>
+                <span>Import Data File</span>
                 <input
                   type="file"
                   accept=".csv"

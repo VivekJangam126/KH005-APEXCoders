@@ -3,7 +3,7 @@ import { Router, Response } from 'express';
 import { getDb } from './db.ts';
 import { AuthRequest, requireAuth, hashPassword, createSession, getSessionCookieOptions } from './auth.ts';
 import { authorizeOperation, logAuditEvent } from './authorization.ts';
-import { seedSampleCollegeDataset } from './seed.ts';
+
 import { config } from './config.ts';
 
 export const adminRouter = Router();
@@ -82,19 +82,7 @@ adminRouter.post('/auth/register-org', async (req, res) => {
       ) VALUES ($1, $2, $3, 'ORG_ADMIN', 'APPROVED', 1, CURRENT_TIMESTAMP, $2)
     `, [membershipId, adminId, orgId]);
 
-    // 4. Seed sample dataset for this new organization
-    try {
-      const seedRes = await seedSampleCollegeDataset(adminId);
-      await db.query(`
-        UPDATE clarity_app.datasets
-        SET organization_id = $1, created_by = $2, updated_by = $2
-        WHERE id = $3
-      `, [orgId, adminId, seedRes.datasetId]);
-    } catch (e) {
-      console.warn('Dataset auto-seed warning on org registration:', e);
-    }
-
-    // 5. Log audit event
+    // 4. Log audit event
     await logAuditEvent(db, {
       organizationId: orgId,
       actorId: adminId,
@@ -133,117 +121,9 @@ adminRouter.post('/auth/register-org', async (req, res) => {
   }
 });
 
-// ----------------------------------------------------
-// Member Registration (Request Access to an Organization)
-// ----------------------------------------------------
-adminRouter.post('/auth/register-member', async (req, res) => {
-  const { organizationId, name, email, password, note } = req.body;
+// NOTE: Self-service member registration removed.
+// Users are created exclusively by Org Admins via POST /admin/users.
 
-  if (!organizationId) {
-    return sendError(res, 400, 'INVALID_INPUT', 'Please select an organization to join.');
-  }
-  if (!name || !name.trim()) {
-    return sendError(res, 400, 'INVALID_INPUT', 'Full name is required.');
-  }
-  if (!email || !email.includes('@')) {
-    return sendError(res, 400, 'INVALID_INPUT', 'A valid email address is required.');
-  }
-  if (!password || password.length < 8) {
-    return sendError(res, 400, 'INVALID_INPUT', 'Password must be at least 8 characters.');
-  }
-
-  const normalizedEmail = email.trim().toLowerCase();
-  const db = await getDb();
-
-  try {
-    // Check organization exists and is active
-    const orgRes = await db.query('SELECT * FROM clarity_app.organizations WHERE id = $1 AND state = $2', [organizationId, 'active']);
-    if (orgRes.rows.length === 0) {
-      return sendError(res, 404, 'ORGANIZATION_NOT_FOUND', 'Selected organization is not found or is inactive.');
-    }
-    const org = orgRes.rows[0];
-
-    // Check email uniqueness
-    const existingUser = await db.query('SELECT id FROM clarity_app.users WHERE email = $1', [normalizedEmail]);
-    if (existingUser.rows.length > 0) {
-      return sendError(res, 409, 'EMAIL_EXISTS', 'An account with this email already exists.');
-    }
-
-    const userId = crypto.randomUUID();
-    const membershipId = crypto.randomUUID();
-    const pwdHash = hashPassword(password);
-
-    // 1. Create User
-    await db.query(`
-      INSERT INTO clarity_app.users (id, name, email, password_hash, account_state)
-      VALUES ($1, $2, $3, $4, 'active')
-    `, [userId, name.trim(), normalizedEmail, pwdHash]);
-
-    // 2. Create Membership with PENDING status
-    await db.query(`
-      INSERT INTO clarity_app.organization_memberships (
-        id, user_id, organization_id, role, status, note, permission_revision
-      ) VALUES ($1, $2, $3, 'MEMBER', 'PENDING', $4, 1)
-    `, [membershipId, userId, organizationId, note ? note.trim() : null]);
-
-    // 3. Notify Org Admins
-    const adminsRes = await db.query<{ user_id: string }>(`
-      SELECT user_id FROM clarity_app.organization_memberships
-      WHERE organization_id = $1 AND role = 'ORG_ADMIN' AND status = 'APPROVED'
-    `, [organizationId]);
-
-    for (const adm of adminsRes.rows) {
-      await db.query(`
-        INSERT INTO clarity_app.notifications (id, owner_id, title, message, event_type, related_entity_type, related_entity_id)
-        VALUES ($1, $2, 'New access request.', $3, 'access_request', 'membership', $4)
-      `, [
-        crypto.randomUUID(),
-        adm.user_id,
-        `${name.trim()} (${normalizedEmail}) requested access to ${org.name}.`,
-        membershipId,
-      ]);
-    }
-
-    // 4. Log audit event
-    await logAuditEvent(db, {
-      organizationId,
-      actorId: userId,
-      actorName: name.trim(),
-      actorEmail: normalizedEmail,
-      action: 'ACCESS_REQUESTED',
-      targetType: 'membership',
-      targetId: membershipId,
-      targetName: name.trim(),
-      summary: `${name.trim()} requested access to ${org.name}.`,
-      details: { note: note || null },
-    });
-
-    // 5. Create session so user can view the pending approval screen
-    const token = await createSession(userId);
-    res.cookie(config.sessionCookieName, token, getSessionCookieOptions(req));
-
-    return res.status(201).json({
-      success: true,
-      message: 'Access request submitted. Awaiting administrator approval.',
-      token,
-      organization: {
-        id: org.id,
-        name: org.name,
-        handle: org.handle,
-      },
-      user: {
-        id: userId,
-        name: name.trim(),
-        email: normalizedEmail,
-        role: 'MEMBER',
-        status: 'PENDING',
-        note: note ? note.trim() : null,
-      },
-    });
-  } catch (err: any) {
-    return sendError(res, 500, 'REGISTRATION_FAILED', err.message);
-  }
-});
 
 // ----------------------------------------------------
 // Public Organization Search & Handle Check
@@ -1392,6 +1272,264 @@ adminRouter.put('/admin/memberships/:membershipId/permissions/:databaseId', requ
     res.json({ success: true, message: 'Permissions updated successfully.' });
   } catch (err: any) {
     return sendError(res, 500, 'PERMISSIONS_UPDATE_FAILED', err.message);
+  }
+});
+
+
+// ----------------------------------------------------
+// Admin: Create a User directly (set credentials + permission level)
+// ----------------------------------------------------
+adminRouter.post('/admin/users', requireAuth, async (req: AuthRequest, res) => {
+  const authCheck = authorizeOperation(req.user, {}, 'admin_manage_users');
+  if (!authCheck.authorized) {
+    return sendError(res, authCheck.status, authCheck.code!, authCheck.reason!);
+  }
+
+  const { name, email, password, permissionLevel } = req.body;
+
+  if (!name || !name.trim()) return sendError(res, 400, 'INVALID_INPUT', 'Full name is required.');
+  if (!email || !email.includes('@')) return sendError(res, 400, 'INVALID_INPUT', 'A valid email address is required.');
+  if (!password || password.length < 8) return sendError(res, 400, 'INVALID_INPUT', 'Password must be at least 8 characters.');
+  if (!['READ_ONLY', 'READ_WRITE'].includes(permissionLevel)) {
+    return sendError(res, 400, 'INVALID_INPUT', 'Permission level must be READ_ONLY or READ_WRITE.');
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const orgId = req.user!.organization!.id;
+  const db = await getDb();
+
+  try {
+    // Check email uniqueness
+    const existing = await db.query('SELECT id FROM clarity_app.users WHERE email = $1', [normalizedEmail]);
+    if (existing.rows.length > 0) {
+      return sendError(res, 409, 'EMAIL_EXISTS', 'An account with this email already exists.');
+    }
+
+    const userId = crypto.randomUUID();
+    const membershipId = crypto.randomUUID();
+    const pwdHash = hashPassword(password);
+
+    // 1. Create user
+    await db.query(`
+      INSERT INTO clarity_app.users (id, name, email, password_hash, account_state)
+      VALUES ($1, $2, $3, $4, 'active')
+    `, [userId, name.trim(), normalizedEmail, pwdHash]);
+
+    // 2. Create APPROVED membership
+    await db.query(`
+      INSERT INTO clarity_app.organization_memberships (
+        id, user_id, organization_id, role, status, permission_revision, approved_at, approved_by
+      ) VALUES ($1, $2, $3, 'MEMBER', 'APPROVED', 1, CURRENT_TIMESTAMP, $4)
+    `, [membershipId, userId, orgId, req.user!.id]);
+
+    // 3. Assign per-database permissions based on level
+    const datasetsRes = await db.query(
+      `SELECT id FROM clarity_app.datasets WHERE organization_id = $1 AND is_active = true`,
+      [orgId]
+    );
+
+    const isReadWrite = permissionLevel === 'READ_WRITE';
+    for (const ds of datasetsRes.rows) {
+      await db.query(`
+        INSERT INTO clarity_app.database_permissions (
+          id, membership_id, database_id,
+          can_read, can_insert, can_update, can_delete_records, can_import_csv, can_export,
+          granted_by
+        ) VALUES ($1, $2, $3, true, $4, $4, false, $4, true, $5)
+        ON CONFLICT (membership_id, database_id) DO UPDATE
+          SET can_read = true, can_insert = $4, can_update = $4,
+              can_delete_records = false, can_import_csv = $4, can_export = true,
+              granted_by = $5, version = database_permissions.version + 1, updated_at = CURRENT_TIMESTAMP
+      `, [crypto.randomUUID(), membershipId, ds.id, isReadWrite, req.user!.id]);
+    }
+
+    await logAuditEvent(db, {
+      organizationId: orgId,
+      actorId: req.user!.id,
+      actorName: req.user!.name,
+      actorEmail: req.user!.email,
+      action: 'USER_CREATED',
+      targetType: 'user',
+      targetId: userId,
+      targetName: name.trim(),
+      summary: `Admin created user ${name.trim()} (${normalizedEmail}) with ${permissionLevel} access.`,
+      details: { permissionLevel },
+    });
+
+    return res.status(201).json({
+      success: true,
+      user: { id: userId, name: name.trim(), email: normalizedEmail, permissionLevel },
+    });
+  } catch (err: any) {
+    return sendError(res, 500, 'USER_CREATION_FAILED', err.message);
+  }
+});
+
+// ----------------------------------------------------
+// Admin: List all users in the organisation
+// ----------------------------------------------------
+adminRouter.get('/admin/users', requireAuth, async (req: AuthRequest, res) => {
+  const authCheck = authorizeOperation(req.user, {}, 'admin_manage_users');
+  if (!authCheck.authorized) {
+    return sendError(res, authCheck.status, authCheck.code!, authCheck.reason!);
+  }
+
+  const db = await getDb();
+  try {
+    const result = await db.query(`
+      SELECT
+        u.id, u.name, u.email, u.account_state,
+        m.id AS membership_id, m.role, m.status, m.created_at,
+        CASE
+          WHEN m.role = 'ORG_ADMIN' THEN 'ORG_ADMIN'
+          WHEN bool_and(p.can_insert) THEN 'READ_WRITE'
+          ELSE 'READ_ONLY'
+        END AS permission_level
+      FROM clarity_app.organization_memberships m
+      JOIN clarity_app.users u ON m.user_id = u.id
+      LEFT JOIN clarity_app.database_permissions p ON p.membership_id = m.id
+      WHERE m.organization_id = $1
+      GROUP BY u.id, u.name, u.email, u.account_state, m.id, m.role, m.status, m.created_at
+      ORDER BY m.created_at ASC
+    `, [req.user!.organization!.id]);
+
+    res.json({ users: result.rows });
+  } catch (err: any) {
+    return sendError(res, 500, 'FETCH_FAILED', err.message);
+  }
+});
+
+// ----------------------------------------------------
+// Admin: Update a user's permission level
+// ----------------------------------------------------
+adminRouter.patch('/admin/users/:id/permissions', requireAuth, async (req: AuthRequest, res) => {
+  const authCheck = authorizeOperation(req.user, {}, 'admin_manage_users');
+  if (!authCheck.authorized) {
+    return sendError(res, authCheck.status, authCheck.code!, authCheck.reason!);
+  }
+
+  const { permissionLevel } = req.body;
+  if (!['READ_ONLY', 'READ_WRITE'].includes(permissionLevel)) {
+    return sendError(res, 400, 'INVALID_INPUT', 'Permission level must be READ_ONLY or READ_WRITE.');
+  }
+
+  const targetUserId = req.params.id;
+  const orgId = req.user!.organization!.id;
+  const db = await getDb();
+
+  try {
+    // Get membership
+    const memberRes = await db.query(`
+      SELECT m.id, u.name FROM clarity_app.organization_memberships m
+      JOIN clarity_app.users u ON m.user_id = u.id
+      WHERE m.user_id = $1 AND m.organization_id = $2 AND m.role = 'MEMBER'
+    `, [targetUserId, orgId]);
+
+    if (memberRes.rows.length === 0) {
+      return sendError(res, 404, 'USER_NOT_FOUND', 'User not found in this organisation.');
+    }
+
+    const { id: membershipId, name: userName } = memberRes.rows[0];
+    const isReadWrite = permissionLevel === 'READ_WRITE';
+
+    // Get all active datasets in the org
+    const datasetsRes = await db.query(
+      `SELECT id FROM clarity_app.datasets WHERE organization_id = $1 AND is_active = true`,
+      [orgId]
+    );
+
+    for (const ds of datasetsRes.rows) {
+      await db.query(`
+        INSERT INTO clarity_app.database_permissions (
+          id, membership_id, database_id,
+          can_read, can_insert, can_update, can_delete_records, can_import_csv, can_export,
+          granted_by
+        ) VALUES ($1, $2, $3, true, $4, $4, false, $4, true, $5)
+        ON CONFLICT (membership_id, database_id) DO UPDATE
+          SET can_insert = $4, can_update = $4, can_import_csv = $4,
+              granted_by = $5, version = database_permissions.version + 1, updated_at = CURRENT_TIMESTAMP
+      `, [crypto.randomUUID(), membershipId, ds.id, isReadWrite, req.user!.id]);
+    }
+
+    // Bump revision so cached sessions re-fetch permissions
+    await db.query(
+      `UPDATE clarity_app.organization_memberships SET permission_revision = permission_revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [membershipId]
+    );
+
+    await logAuditEvent(db, {
+      organizationId: orgId,
+      actorId: req.user!.id,
+      actorName: req.user!.name,
+      actorEmail: req.user!.email,
+      action: 'PERMISSIONS_UPDATED',
+      targetType: 'user',
+      targetId: targetUserId,
+      targetName: userName,
+      summary: `Updated ${userName}'s permission level to ${permissionLevel}.`,
+      details: { permissionLevel },
+    });
+
+    res.json({ success: true, message: `Permissions updated to ${permissionLevel}.` });
+  } catch (err: any) {
+    return sendError(res, 500, 'PERMISSIONS_UPDATE_FAILED', err.message);
+  }
+});
+
+// ----------------------------------------------------
+// Admin: Remove a user from the organisation
+// ----------------------------------------------------
+adminRouter.delete('/admin/users/:id', requireAuth, async (req: AuthRequest, res) => {
+  const authCheck = authorizeOperation(req.user, {}, 'admin_manage_users');
+  if (!authCheck.authorized) {
+    return sendError(res, authCheck.status, authCheck.code!, authCheck.reason!);
+  }
+
+  const targetUserId = req.params.id;
+  const orgId = req.user!.organization!.id;
+
+  if (targetUserId === req.user!.id) {
+    return sendError(res, 400, 'CANNOT_DELETE_SELF', 'You cannot remove your own account.');
+  }
+
+  const db = await getDb();
+  try {
+    const memberRes = await db.query(`
+      SELECT m.id, u.name, u.email FROM clarity_app.organization_memberships m
+      JOIN clarity_app.users u ON m.user_id = u.id
+      WHERE m.user_id = $1 AND m.organization_id = $2
+    `, [targetUserId, orgId]);
+
+    if (memberRes.rows.length === 0) {
+      return sendError(res, 404, 'USER_NOT_FOUND', 'User not found in this organisation.');
+    }
+
+    const { name: userName, email: userEmail } = memberRes.rows[0];
+
+    // Delete membership (cascades to database_permissions)
+    await db.query(
+      `DELETE FROM clarity_app.organization_memberships WHERE user_id = $1 AND organization_id = $2`,
+      [targetUserId, orgId]
+    );
+
+    // Delete the user account entirely
+    await db.query(`DELETE FROM clarity_app.users WHERE id = $1`, [targetUserId]);
+
+    await logAuditEvent(db, {
+      organizationId: orgId,
+      actorId: req.user!.id,
+      actorName: req.user!.name,
+      actorEmail: req.user!.email,
+      action: 'USER_REMOVED',
+      targetType: 'user',
+      targetId: targetUserId,
+      targetName: userName,
+      summary: `Admin removed user ${userName} (${userEmail}) from the organisation.`,
+    });
+
+    res.json({ success: true, message: 'User removed successfully.' });
+  } catch (err: any) {
+    return sendError(res, 500, 'USER_DELETION_FAILED', err.message);
   }
 });
 

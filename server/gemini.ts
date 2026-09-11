@@ -562,3 +562,77 @@ function determineChartRecommendation(
     reasoning: 'Multi-column dataset without clear metric pairing is best viewed as a tabular grid.',
   };
 }
+
+export async function geminiDocumentExtraction(
+  text: string | null,
+  filename: string,
+  mimeType: string,
+  filePath?: string
+): Promise<{ tables: any[] } | null> {
+  const client = getAiClient();
+  if (!client) {
+    throw new Error('Gemini API is not configured.');
+  }
+
+  const prompt = `Extract all tabular data from the following document into a structured JSON array.
+If no tabular data exists, return an empty array [].
+Respond ONLY with a JSON object matching this schema:
+{
+  "tables": [
+    {
+      "name": "Table Name",
+      "columns": [
+        {
+          "originalName": "Column Header",
+          "internalName": "column_header",
+          "detectedType": "TEXT",
+          "isNullable": true
+        }
+      ],
+      "rows": [
+        {
+          "column_header": "value"
+        }
+      ],
+      "issues": []
+    }
+  ]
+}
+
+Document Name: ${filename}
+`;
+
+  let contents: any[] = [{ text: prompt }];
+
+  if (filePath && !text) {
+    const fs = await import('fs');
+    const buffer = await fs.promises.readFile(filePath);
+    contents.push({
+      inlineData: {
+        data: buffer.toString('base64'),
+        mimeType: mimeType === 'application/pdf' ? 'application/pdf' : mimeType,
+      }
+    });
+  } else if (text) {
+    contents.push({ text: `\n\n--- DOCUMENT CONTENT ---\n${text}` });
+  }
+
+  const response = await generateContentWithFallback(client, {
+    preferredModel: 'gemini-3.8-flash',
+    contents: contents,
+    config: {
+      temperature: 0.1,
+      responseMimeType: 'application/json',
+    },
+  });
+
+  if (!response.text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(response.text);
+  } catch (err) {
+    throw new Error('Failed to parse AI extraction result as JSON.');
+  }
+}

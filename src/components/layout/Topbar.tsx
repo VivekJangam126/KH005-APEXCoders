@@ -3,7 +3,7 @@ import { useAuth } from '../../context/AuthContext.tsx';
 import { useData } from '../../context/DataContext.tsx';
 import { NotificationCenter } from './NotificationCenter.tsx';
 import { DatabasePopover } from './DatabasePopover.tsx';
-import { PersonaSwitcher } from '../common/PersonaSwitcher.tsx';
+
 import {
   Menu,
   Bell,
@@ -91,10 +91,8 @@ export function Topbar({ onToggleMobileMenu, onNavigate }: TopbarProps) {
         </div>
       </div>
 
-      {/* Right: Persona Switcher, DB status, Notifications, User Menu */}
-      <div className="flex items-center gap-2.5">
-        {/* Instant Persona Switcher for testing RBAC & Multi-tenancy */}
-        <PersonaSwitcher />
+      {/* Right: DB status, Notifications, User Menu */}
+      <div className="flex items-center gap-1.5 sm:gap-3">
 
         {/* Database connectivity popover trigger */}
         <div className="relative">
