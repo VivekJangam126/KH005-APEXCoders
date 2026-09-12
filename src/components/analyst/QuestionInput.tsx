@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Sparkles,
   ArrowRight,
@@ -8,6 +8,8 @@ import {
   Lightbulb,
 } from 'lucide-react';
 import { useData } from '../../context/DataContext.tsx';
+import { api } from '../../lib/api.ts';
+import { HistoryItem } from '../../types/index.ts';
 
 interface QuestionInputProps {
   onSubmit: (question: string) => Promise<void>;
@@ -15,6 +17,8 @@ interface QuestionInputProps {
   loadingStep?: string;
   error?: string | null;
   clarificationQuestion?: string | null;
+  clarificationOptions?: string[];
+  smartSuggestions?: string[];
 }
 
 export function QuestionInput({
@@ -23,48 +27,90 @@ export function QuestionInput({
   loadingStep = 'Analyzing question...',
   error,
   clarificationQuestion,
+  clarificationOptions = [],
+  smartSuggestions = [],
 }: QuestionInputProps) {
   const { activeDataset, schema } = useData();
   const [question, setQuestion] = useState('');
+  const [recentOperations, setRecentOperations] = useState<HistoryItem[]>([]);
 
-  // Generate suggested questions based on tables in schema
-  const suggestions = React.useMemo(() => {
+  useEffect(() => {
+    let isCurrent = true;
+    setRecentOperations([]);
+    if (!activeDataset) return () => { isCurrent = false; };
+
+    api.history.list(undefined, undefined, 20)
+      .then(({ history }) => {
+        if (isCurrent) {
+          setRecentOperations(history.filter(item =>
+            item.dataset_id === activeDataset.id &&
+            (item.execution_status === 'completed' || item.status === 'executed')
+          ));
+        }
+      })
+      .catch(error => {
+        console.warn('Could not load recent suggestions:', error);
+      });
+
+    return () => { isCurrent = false; };
+  }, [activeDataset?.id]);
+
+  // Prefer completed questions for this database, then fill the four slots from its schema.
+  const suggestions = useMemo(() => {
+    const result: string[] = [];
+    const add = (value: string) => {
+      const normalized = value.trim();
+      if (normalized && !result.some(existing => existing.toLowerCase() === normalized.toLowerCase())) {
+        result.push(normalized);
+      }
+    };
+
+    recentOperations.forEach(operation => add(operation.question));
+
     if (!schema || schema.tables.length === 0) {
-      return [
+      [
         'How many total records are there?',
-        'List all entries ordered by recent dates',
-      ];
+        'List all entries ordered by the most recent date',
+        'Show the distribution of records by category',
+        'What are the top 5 records by the main numeric value?',
+      ].forEach(add);
+      return result.slice(0, 4);
     }
 
     const tableNames = schema.tables.map(t => t.name.toLowerCase());
 
     if (tableNames.includes('marks') || tableNames.includes('students')) {
-      return [
+      [
         'Compare average marks across departments',
         'Count total students in each department',
         'Which students scored above 85 in semester 4?',
         'List the top 5 highest average marks by department',
-      ];
+      ].forEach(add);
+    } else {
+      const firstTable = schema.tables[0];
+      const numCol = firstTable.columns.find(c =>
+        /int|numeric|decimal|real|double|float/i.test(c.dataType)
+      );
+      const textCol = firstTable.columns.find(c =>
+        /char|text|uuid/i.test(c.dataType)
+      );
+
+      add(`Count total records in ${firstTable.name}`);
+      if (textCol && numCol) add(`Average ${numCol.name} grouped by ${textCol.name}`);
+      if (textCol) add(`Distribution of entries by ${textCol.name}`);
+      if (numCol) add(`List the top 5 ${firstTable.name} by ${numCol.name}`);
     }
 
-    // Generic schema-aware suggestions
-    const firstTable = schema.tables[0];
-    const numCol = firstTable.columns.find(c =>
-      c.dataType.includes('int') || c.dataType.includes('numeric') || c.dataType.includes('float')
-    );
-    const textCol = firstTable.columns.find(c =>
-      c.dataType.includes('char') || c.dataType.includes('text')
-    );
-
-    const list = [`Count total records in ${firstTable.name}`];
-    if (textCol && numCol) {
-      list.push(`Average ${numCol.name} grouped by ${textCol.name}`);
-    }
-    if (textCol) {
-      list.push(`Distribution of entries by ${textCol.name}`);
-    }
-    return list;
-  }, [schema]);
+    // Keep exactly four visible suggestions even when the schema has few typed columns.
+    const tableName = schema.tables[0]?.name || 'this table';
+    [
+      `Show all records from ${tableName}`,
+      `How many records are in ${tableName}?`,
+      `Show the first 5 records from ${tableName}`,
+      `Summarize the available data in ${tableName}`,
+    ].forEach(add);
+    return result.slice(0, 4);
+  }, [recentOperations, schema]);
 
   const handleSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -135,6 +181,21 @@ export function QuestionInput({
           <div className="space-y-1">
             <p className="font-semibold">Clarification required:</p>
             <p className="leading-relaxed">{clarificationQuestion}</p>
+            {clarificationOptions.length > 0 && (
+              <div className="flex flex-wrap gap-2 pt-2">
+                {clarificationOptions.map(option => (
+                  <button
+                    key={option}
+                    type="button"
+                    onClick={() => onSubmit(`Show ${option}`)}
+                    disabled={isLoading}
+                    className="px-2.5 py-1 rounded-lg bg-amber-100 dark:bg-amber-900/40 hover:bg-amber-200 text-amber-900 dark:text-amber-200"
+                  >
+                    {option}
+                  </button>
+                ))}
+              </div>
+            )}
             <p className="text-[11px] text-amber-700/80 dark:text-amber-400">
               Please refine your question above with more specifics.
             </p>
@@ -149,6 +210,22 @@ export function QuestionInput({
           <div>
             <p className="font-semibold">Unable to formulate valid read-only query</p>
             <p className="leading-relaxed mt-0.5">{error}</p>
+            {smartSuggestions.length > 0 && (
+              <div className="mt-3 space-y-1.5">
+                <p className="font-semibold">Try asking:</p>
+                {smartSuggestions.map(suggestion => (
+                  <button
+                    key={suggestion}
+                    type="button"
+                    onClick={() => onSubmit(suggestion)}
+                    disabled={isLoading}
+                    className="block text-left underline hover:no-underline"
+                  >
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}

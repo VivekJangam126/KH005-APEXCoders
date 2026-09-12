@@ -25,6 +25,8 @@ export function AnalystView({ onOpenImport }: AnalystViewProps) {
   const [loadingStep, setLoadingStep] = useState('Analyzing question...');
   const [error, setError] = useState<string | null>(null);
   const [clarificationQuestion, setClarificationQuestion] = useState<string | null>(null);
+  const [clarificationOptions, setClarificationOptions] = useState<string[]>([]);
+  const [smartSuggestions, setSmartSuggestions] = useState<string[]>([]);
 
   const [currentAnalysis, setCurrentAnalysis] = useState<AnalysisRecord | null>(null);
   const [currentPreview, setCurrentPreview] = useState<QueryPreview | null>(null);
@@ -58,6 +60,8 @@ export function AnalystView({ onOpenImport }: AnalystViewProps) {
     setIsLoading(true);
     setError(null);
     setClarificationQuestion(null);
+    setClarificationOptions([]);
+    setSmartSuggestions([]);
     setLoadingStep('Understanding question intent...');
 
     try {
@@ -70,12 +74,14 @@ export function AnalystView({ onOpenImport }: AnalystViewProps) {
 
       if (prep.status === 'needs_clarification') {
         setClarificationQuestion(prep.clarificationQuestion || 'Could you please clarify your question?');
+        setClarificationOptions(prep.clarificationOptions || prep.interpretation?.clarificationOptions || []);
         setIsLoading(false);
         return;
       }
 
-      if (prep.status === 'unsupported' || prep.status === 'failed') {
-        setError(prep.error || 'The requested analysis cannot be safely translated to a read-only query.');
+      if (prep.status === 'unsupported' || prep.status === 'out_of_scope' || prep.status === 'failed') {
+        setError(prep.error || prep.interpretation?.validation?.reason || 'The requested analysis cannot be safely translated to a validated query.');
+        setSmartSuggestions(prep.suggestions || prep.interpretation?.validation?.suggestions || []);
         setIsLoading(false);
         return;
       }
@@ -88,6 +94,7 @@ export function AnalystView({ onOpenImport }: AnalystViewProps) {
     } catch (err: any) {
       console.error('Analysis formulation error:', err);
       setError(err.message || 'Failed to analyze question.');
+      setSmartSuggestions(err.suggestions || []);
     } finally {
       setIsLoading(false);
     }
@@ -124,6 +131,8 @@ export function AnalystView({ onOpenImport }: AnalystViewProps) {
     setCurrentResult(null);
     setError(null);
     setClarificationQuestion(null);
+    setClarificationOptions([]);
+    setSmartSuggestions([]);
   };
 
   // If no datasets exist, present a friendly onboarding card with sample seeder
@@ -185,6 +194,8 @@ export function AnalystView({ onOpenImport }: AnalystViewProps) {
           loadingStep={loadingStep}
           error={error}
           clarificationQuestion={clarificationQuestion}
+          clarificationOptions={clarificationOptions}
+          smartSuggestions={smartSuggestions}
         />
       )}
 

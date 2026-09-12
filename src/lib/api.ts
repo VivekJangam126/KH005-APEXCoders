@@ -60,6 +60,8 @@ async function request<T = any>(
     (err as any).code = errBody.error?.code || 'UNKNOWN_ERROR';
     (err as any).status = res.status;
     (err as any).retryable = errBody.error?.retryable;
+    (err as any).suggestions = errBody.suggestions || [];
+    (err as any).clarificationOptions = errBody.clarificationOptions || [];
     throw err;
   }
 
@@ -147,6 +149,14 @@ export const api = {
         body: JSON.stringify({ uploadId, datasetName, tableName }),
       });
     },
+    async getImportProgress(uploadId: string): Promise<{
+      completedRows: number;
+      totalRows: number;
+      percent: number;
+      status: 'importing' | 'completed' | 'failed';
+    }> {
+      return request(`/datasets/import/${uploadId}/progress`);
+    },
   },
 
   analyses: {
@@ -194,10 +204,11 @@ export const api = {
   },
 
   history: {
-    async list(search?: string, status?: string): Promise<{ history: HistoryItem[] }> {
+    async list(search?: string, status?: string, limit = 20): Promise<{ history: HistoryItem[] }> {
       const params = new URLSearchParams();
       if (search) params.set('search', search);
       if (status && status !== 'all') params.set('status', status);
+      params.set('limit', String(limit));
       return request(`/history?${params.toString()}`);
     },
   },
@@ -251,7 +262,7 @@ export const api = {
       if (filters?.search) params.set('search', filters.search);
       if (filters?.limit) params.set('limit', filters.limit.toString());
       if (filters?.offset) params.set('offset', filters.offset.toString());
-      return request(`/admin/audit-logs/${orgId}?${params.toString()}`);
+      return request(`/admin/organizations/${orgId}/audit-logs?${params.toString()}`);
     },
     // Admin-controlled user management
     async createUser(data: { name: string; email: string; password: string; permissionLevel: 'READ_ONLY' | 'READ_WRITE' }): Promise<{ success: boolean; user: any }> {
