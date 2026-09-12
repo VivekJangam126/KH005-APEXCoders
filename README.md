@@ -1,4 +1,4 @@
-﻿# Ask2SQL — APEXCoders
+﻿# ClaritySQL — APEXCoders
 
 > **AI-powered natural-language SQL analytics platform for multi-tenant organisations.**
 > Ask questions in plain English, get instant SQL, charts, and grounded insights — all backed by a live PostgreSQL database and strict role-based access control.
