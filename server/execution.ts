@@ -147,6 +147,8 @@ export async function confirmAndExecuteQuery(
   }
 
   const preview = previewRes.rows[0];
+  const operation = (JSON.parse(preview.validation_report_json || '{}') as ValidationReport).generatedOperation;
+  const isMutation = operation === 'INSERT' || operation === 'UPDATE' || operation === 'DELETE';
 
   // Check if expired
   if (new Date(preview.expires_at).getTime() < Date.now()) {
@@ -218,19 +220,21 @@ export async function confirmAndExecuteQuery(
     [executionId, previewId, preview.analysis_id, ownerId, preview.dataset_id, execKey]
   );
 
-  // Execute in isolated read-only transaction
+  // Execute only the SQL that was approved in the consumed preview.
   let rawRows: any[] = [];
   let columns: { name: string; type?: string }[] = [];
+  let affectedRows = 0;
   let durationMs = 0;
   let status: 'completed' | 'failed' = 'completed';
   let errorMessage: string | undefined;
   let errorCategory: string | undefined;
 
   try {
-    // Set search path to dataset schema
-    await db.exec(`SET search_path TO "${preview.internal_schema}";`);
-
-    const queryPromise = db.query(preview.sql_text, JSON.parse(preview.params_json || '[]'));
+    const queryPromise = db.queryInSchema(
+      preview.internal_schema,
+      preview.sql_text,
+      JSON.parse(preview.params_json || '[]')
+    );
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('Query execution exceeded timeout limit.')), config.queryTimeoutMs)
     );
@@ -239,6 +243,7 @@ export async function confirmAndExecuteQuery(
     durationMs = Date.now() - startTime;
 
     rawRows = queryRes.rows || [];
+    affectedRows = typeof queryRes.rowCount === 'number' ? queryRes.rowCount : rawRows.length;
     columns = (queryRes.fields || []).map((f: any) => ({ name: f.name }));
 
     // If fields missing from adapter, derive from first row
@@ -250,11 +255,6 @@ export async function confirmAndExecuteQuery(
     status = 'failed';
     errorMessage = err.message;
     errorCategory = err.message.includes('timeout') ? 'TIMEOUT' : 'EXECUTION_ERROR';
-  } finally {
-    // Reset search path
-    try {
-      await db.exec('RESET search_path;');
-    } catch {}
   }
 
   // Update execution status
@@ -332,9 +332,9 @@ export async function confirmAndExecuteQuery(
     ]
   );
 
-  // Generate grounded insights & chart recommendation
+  // Insights are meaningful for returned data, not mutation row counts.
   let insight: any = undefined;
-  try {
+  if (!isMutation) try {
     const colNames = columns.map(c => c.name);
     insight = await generateGroundedInsights(
       preview.question,
@@ -367,7 +367,9 @@ export async function confirmAndExecuteQuery(
     [
       crypto.randomUUID(),
       ownerId,
-      `Returned ${processedRows.length} rows in ${durationMs}ms.`,
+      isMutation
+        ? `${affectedRows} row${affectedRows === 1 ? '' : 's'} affected in ${durationMs}ms.`
+        : `Returned ${processedRows.length} rows in ${durationMs}ms.`,
       executionId,
     ]
   );
@@ -380,7 +382,7 @@ export async function confirmAndExecuteQuery(
     durationMs,
     columns,
     rows: processedRows,
-    totalRows: processedRows.length,
+    totalRows: isMutation ? affectedRows : processedRows.length,
     isCapped,
     sizeBytes,
     insight,

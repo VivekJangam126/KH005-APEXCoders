@@ -40,6 +40,7 @@ export function RecordsExplorer({
   const [selectedTable, setSelectedTable] = useState<string>('');
   const [records, setRecords] = useState<any[]>([]);
   const [columns, setColumns] = useState<any[]>([]);
+  const [primaryKey, setPrimaryKey] = useState<string | null>(null);
   const [totalRecords, setTotalRecords] = useState<number>(0);
   const [page, setPage] = useState(1);
   const [pageSize] = useState(15);
@@ -95,6 +96,7 @@ export function RecordsExplorer({
       });
       setRecords(data.rows || data.records || []);
       setColumns(data.columns || []);
+      setPrimaryKey(data.primaryKey || null);
       setTotalRecords(data.totalRows ?? data.total ?? data.pagination?.total ?? 0);
     } catch (err: any) {
       setError(err.message || 'Failed to load records');
@@ -150,7 +152,11 @@ export function RecordsExplorer({
     if (!editRecord) return;
     setError(null);
     try {
-      const pkCol = currentTableMetadata?.primaryKeys[0] || 'id';
+      const pkCol = primaryKey || currentTableMetadata?.primaryKeys[0];
+      if (!pkCol || editRecord[pkCol] === undefined) {
+        setError('The table primary key could not be identified. Refresh the schema and try again.');
+        return;
+      }
       const res = await api.data.previewMutation(dataset.id, selectedTable, {
         operation: 'update',
         recordData: formFields,
@@ -173,7 +179,11 @@ export function RecordsExplorer({
     if (!deleteRecord) return;
     setError(null);
     try {
-      const pkCol = currentTableMetadata?.primaryKeys[0] || 'id';
+      const pkCol = primaryKey || currentTableMetadata?.primaryKeys[0];
+      if (!pkCol || deleteRecord[pkCol] === undefined) {
+        setError('The table primary key could not be identified. Refresh the schema and try again.');
+        return;
+      }
       const res = await api.data.previewMutation(dataset.id, selectedTable, {
         operation: 'delete_records',
         targetCriteria: { [pkCol]: deleteRecord[pkCol] },
@@ -397,7 +407,10 @@ export function RecordsExplorer({
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-slate-700 dark:text-slate-300">
               {records.map((row, idx) => (
-                <tr key={idx} className="hover:bg-slate-50/50 dark:hover:bg-slate-850/50 transition-colors">
+                <tr
+                  key={primaryKey && row[primaryKey] !== undefined ? String(row[primaryKey]) : idx}
+                  className="hover:bg-slate-50/50 dark:hover:bg-slate-850/50 transition-colors"
+                >
                   {columns.map(col => (
                     <td key={col.name} className="px-4 py-2.5 whitespace-nowrap max-w-[240px] truncate">
                       {row[col.name] !== null && row[col.name] !== undefined ? String(row[col.name]) : (

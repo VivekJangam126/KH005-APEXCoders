@@ -39,6 +39,11 @@ export function QueryReviewCard({
   const [isCorrectionDrawerOpen, setIsCorrectionDrawerOpen] = useState(false);
 
   const report = preview.validationReport;
+  const operation = report.generatedOperation || preview.operation || 'UNKNOWN';
+  const isReadOnly = operation === 'SELECT';
+  const referencedTables = report.referencedTables?.length
+    ? report.referencedTables.join(', ')
+    : datasetName;
   const hasCorrections = preview.attempts && preview.attempts.length > 1;
 
   return (
@@ -144,6 +149,15 @@ export function QueryReviewCard({
               {preview.sql}
             </pre>
           </div>
+          {preview.valueResolutions && preview.valueResolutions.length > 0 && (
+            <div className="mt-3 rounded-xl border border-indigo-200 bg-indigo-50 p-3 text-xs dark:border-indigo-900 dark:bg-indigo-950/30">
+              {preview.valueResolutions.map(resolution => (
+                <div key={`${resolution.field}:${resolution.userValue}`}>
+                  <strong>{resolution.field}</strong>: User value: {resolution.userValue} | Resolved DB value: {resolution.resolvedValue}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Section 3: AST Validation Report */}
@@ -169,9 +183,13 @@ export function QueryReviewCard({
             <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700 flex items-start gap-2.5">
               <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
               <div>
-                <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">Read-Only Enforced</p>
+                <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                  {isReadOnly ? 'Read-Only Query' : `${operation} Operation`}
+                </p>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-snug">
-                  Zero INSERT/UPDATE/DELETE/DDL; SELECT only.
+                  {isReadOnly
+                    ? report.checks.readOnly.message
+                    : `${operation} passed operation and safety validation; execution requires confirmation.`}
                 </p>
               </div>
             </div>
@@ -181,7 +199,7 @@ export function QueryReviewCard({
               <div>
                 <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">Schema Objects</p>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-snug">
-                  Tables restricted strictly to "{datasetName}".
+                  Referenced tables: {referencedTables}.
                 </p>
               </div>
             </div>
@@ -189,9 +207,13 @@ export function QueryReviewCard({
             <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700 flex items-start gap-2.5">
               <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
               <div>
-                <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">Result Limits</p>
+                <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                  {isReadOnly ? 'Result Limits' : 'Execution Safety'}
+                </p>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-snug">
-                  Bounded to {preview.resultLimit} rows max.
+                  {isReadOnly
+                    ? `Bounded to ${preview.resultLimit} rows max.`
+                    : (report.safety?.message || 'Mutation is validated before execution.')}
                 </p>
               </div>
             </div>

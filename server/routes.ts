@@ -13,8 +13,9 @@ import {
 } from './auth.ts';
 import { config } from './config.ts';
 import { parseAndValidateCsv, createAndPopulateTable, sanitizeIdentifier } from './csv.ts';
-import { extractSchemaMetadata } from './schema.ts';
-import { understandQuestion, generateSqlWithCorrection, generateGroundedInsights } from './gemini.ts';
+import { extractSchemaMetadata, hydrateDistinctValues } from './schema.ts';
+import { understandQuestion, generateSqlWithCorrection, generateGroundedInsights, resolveFilterValues, buildSmartSuggestions } from './gemini.ts';
+import { OperationType } from './validator.ts';
 import { createPreview, confirmAndExecuteQuery, computePreviewDigest } from './execution.ts';
 import { seedSampleCollegeDataset, KNOWN_TEST_CSVS } from './seed.ts';
 import { adminRouter } from './admin-routes.ts';
@@ -22,6 +23,7 @@ import { dataRouter } from './data-routes.ts';
 import { authorizeOperation, logAuditEvent } from './authorization.ts';
 
 export const apiRouter = express.Router();
+const importProgress = new Map<string, { userId: string; completedRows: number; totalRows: number; status: 'importing' | 'completed' | 'failed' }>();
 
 // Mount administrative and data exploration sub-routers
 apiRouter.use(adminRouter);
@@ -47,6 +49,16 @@ function sendError(
       requestId: crypto.randomUUID(),
     },
   });
+}
+
+function parseJsonColumn<T>(value: unknown, fallback: T): T {
+  if (value === null || value === undefined || value === '') {
+    return fallback;
+  }
+  if (typeof value === 'string') {
+    return JSON.parse(value) as T;
+  }
+  return value as T;
 }
 
 function getSessionCookieOptions(req: any) {
@@ -328,6 +340,18 @@ apiRouter.post('/uploads', requireAuth, upload.single('file') as any, async (req
       req.file.size
     );
 
+    if (job.extractionStatus === 'NOT_TABULAR' || job.extractionStatus === 'INVALID_FILE' ||
+        job.extractionStatus === 'UNSUPPORTED_FORMAT' || job.candidateTables.length === 0) {
+      const reason = job.issues.find(issue => issue.severity === 'error' || issue.message)?.message
+        || 'The uploaded document does not contain a usable database table.';
+      return sendError(res, 422, 'INVALID_DOCUMENT', `Invalid document: ${reason}`);
+    }
+
+    if (job.issues.some(issue => issue.severity === 'error')) {
+      const reason = job.issues.find(issue => issue.severity === 'error')!.message;
+      return sendError(res, 422, 'INVALID_DOCUMENT', `Invalid document: ${reason}`);
+    }
+
     // Structured diagnostic log (no credentials, no full row payloads)
     console.log(`[Ingestion] jobId=${jobId} file="${filename}" format=${job.format} status=${job.extractionStatus} tables=${job.candidateTables.length} issues=${job.issues.length}`);
     for (const t of job.candidateTables) {
@@ -381,7 +405,9 @@ apiRouter.post('/uploads', requireAuth, upload.single('file') as any, async (req
       previewRows: legacyPreview,
       issues: job.issues,
       extractionStatus: job.extractionStatus,
-      candidateTables: job.candidateTables
+      candidateTables: job.candidateTables,
+      profile: job.candidateTables[0]?.profile,
+      semanticAnalysis: job.candidateTables[0]?.semanticAnalysis
     });
   } catch (err: any) {
     return sendError(res, 500, 'INGESTION_FAILED', err.message);
@@ -400,7 +426,7 @@ apiRouter.get('/uploads/:id', requireAuth, async (req: AuthRequest, res) => {
   }
 
   const u = resUpload.rows[0];
-  const candidateTables = JSON.parse(u.candidate_tables || '[]');
+  const candidateTables = parseJsonColumn<any[]>(u.candidate_tables, []);
   const legacyColumns = candidateTables.length > 0 ? candidateTables[0].columns : [];
   const legacyPreview = candidateTables.length > 0 ? candidateTables[0].rows.slice(0, 100) : [];
   
@@ -415,9 +441,11 @@ apiRouter.get('/uploads/:id', requireAuth, async (req: AuthRequest, res) => {
     totalColumns: legacyColumns.length,
     columns: legacyColumns,
     previewRows: legacyPreview,
-    issues: JSON.parse(u.issues || '[]'),
+    issues: parseJsonColumn(u.issues, []),
     extractionStatus: u.extraction_status,
-    candidateTables: candidateTables
+    candidateTables,
+    profile: candidateTables[0]?.profile,
+    semanticAnalysis: candidateTables[0]?.semanticAnalysis,
   });
 });
 
@@ -428,6 +456,19 @@ apiRouter.delete('/uploads/:id', requireAuth, async (req: AuthRequest, res) => {
     [req.params.id, req.user!.id]
   );
   res.json({ success: true, message: 'Upload draft discarded safely.' });
+});
+
+apiRouter.get('/datasets/import/:uploadId/progress', requireAuth, (req: AuthRequest, res) => {
+  const progress = importProgress.get(req.params.uploadId);
+  if (!progress || progress.userId !== req.user!.id) {
+    return sendError(res, 404, 'IMPORT_PROGRESS_NOT_FOUND', 'Import progress was not found.');
+  }
+  res.json({
+    completedRows: progress.completedRows,
+    totalRows: progress.totalRows,
+    percent: progress.totalRows === 0 ? 100 : Math.round((progress.completedRows / progress.totalRows) * 100),
+    status: progress.status,
+  });
 });
 
 // ----------------------------------------------------
@@ -455,7 +496,17 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
   }
 
   const upload = uploadRes.rows[0];
-  const candidateTables = JSON.parse(upload.candidate_tables || '[]');
+  let candidateTables: any[];
+  try {
+    // pg parses JSON/JSONB columns automatically; only stringify values need parsing.
+    candidateTables = parseJsonColumn<any[]>(upload.candidate_tables, []);
+  } catch (err: any) {
+    return sendError(res, 422, 'INVALID_UPLOAD', `The upload metadata is invalid: ${err.message}`);
+  }
+
+  if (!Array.isArray(candidateTables)) {
+    return sendError(res, 422, 'INVALID_UPLOAD', 'The upload metadata does not contain a valid table list.');
+  }
   
   if (candidateTables.length === 0) {
     return sendError(res, 400, 'NO_DATA', 'No tabular data was found to import.');
@@ -485,6 +536,12 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
 
   const datasetId = crypto.randomUUID();
   const internalSchema = `data_${crypto.randomBytes(6).toString('hex')}`;
+  importProgress.set(uploadId, {
+    userId: req.user!.id,
+    completedRows: 0,
+    totalRows: allRows.length,
+    status: 'importing',
+  });
 
   try {
     // 1. Create dataset entry
@@ -506,7 +563,14 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
     }
 
     // 2. Create and populate table
-    const result = await createAndPopulateTable(db, internalSchema, finalTableName, columns, allRows);
+    const result = await createAndPopulateTable(db, internalSchema, finalTableName, columns, allRows, (completedRows, totalRows) => {
+      importProgress.set(uploadId, {
+        userId: req.user!.id,
+        completedRows,
+        totalRows,
+        status: 'importing',
+      });
+    });
 
     // Verify actual row count matches plan — fail loudly if they diverge
     const verifyRes = await db.query<{ cnt: string }>(
@@ -538,6 +602,12 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
     );
 
     await db.query(`DELETE FROM clarity_app.staged_rows WHERE job_id = $1`, [uploadId]);
+    importProgress.set(uploadId, {
+      userId: req.user!.id,
+      completedRows: result.rowCount,
+      totalRows: result.rowCount,
+      status: 'completed',
+    });
 
     // 6. Log audit event
     if (req.user?.organization?.id) {
@@ -580,6 +650,21 @@ apiRouter.post('/datasets/import', requireAuth, async (req: AuthRequest, res) =>
       },
     });
   } catch (err: any) {
+    importProgress.set(uploadId, {
+      userId: req.user!.id,
+      completedRows: 0,
+      totalRows: allRows.length,
+      status: 'failed',
+    });
+    // Remove partial database artifacts so a failed import can be retried cleanly.
+    try {
+      await db.exec(`DROP SCHEMA IF EXISTS "${internalSchema}" CASCADE;`);
+      await db.query('DELETE FROM clarity_app.database_permissions WHERE database_id = $1', [datasetId]);
+      await db.query('DELETE FROM clarity_app.dataset_tables WHERE dataset_id = $1', [datasetId]);
+      await db.query('DELETE FROM clarity_app.datasets WHERE id = $1', [datasetId]);
+    } catch (cleanupErr: any) {
+      console.error(`[Import] Cleanup failed for dataset ${datasetId}: ${cleanupErr.message}`);
+    }
     return sendError(res, 500, 'IMPORT_FAILED', `Failed to create analytical dataset: ${err.message}`);
   }
 });
@@ -704,7 +789,7 @@ apiRouter.post('/analyses', requireAuth, async (req: AuthRequest, res) => {
 apiRouter.post('/analyses/:id/prepare', requireAuth, async (req: AuthRequest, res) => {
   const db = await getDb();
   const analysisRes = await db.query(
-    `SELECT a.*, d.internal_schema
+    `    SELECT a.*, d.internal_schema, d.organization_id, d.lifecycle_state
      FROM clarity_app.analyses a
      JOIN clarity_app.datasets d ON a.dataset_id = d.id
      WHERE a.id = $1 AND a.owner_id = $2`,
@@ -737,6 +822,7 @@ apiRouter.post('/analyses/:id/prepare', requireAuth, async (req: AuthRequest, re
     tables = meta.tables;
     fingerprint = meta.fingerprint;
   }
+  await hydrateDistinctValues(db, analysis.internal_schema, tables);
 
   if (tables.length === 0) {
     return sendError(res, 400, 'EMPTY_DATASET', 'The active dataset contains no tables.');
@@ -757,23 +843,95 @@ apiRouter.post('/analyses/:id/prepare', requireAuth, async (req: AuthRequest, re
         analysisId: analysis.id,
         status: 'needs_clarification',
         interpretation,
+        clarificationQuestion: interpretation.clarificationQuestion,
+        clarificationOptions: interpretation.clarificationOptions || [],
       });
     }
 
-    if (interpretation.status === 'unsupported') {
+    if (interpretation.status === 'unsupported' || interpretation.status === 'out_of_scope') {
+      const suggestions = buildSmartSuggestions(analysis.question, tables, interpretation.validation.reason);
+      const updatedInterpretation = {
+        ...interpretation,
+        validation: { ...interpretation.validation, suggestions },
+      };
       await db.query(
         `UPDATE clarity_app.analyses SET status = 'unsupported', summary = $1 WHERE id = $2`,
         [interpretation.summary, analysis.id]
       );
       return res.json({
         analysisId: analysis.id,
-        status: 'unsupported',
-        interpretation,
+        status: interpretation.status,
+        interpretation: updatedInterpretation,
+        suggestions,
       });
     }
 
+    const filterResolution = resolveFilterValues(interpretation, tables);
+    if (filterResolution.issues.length > 0) {
+      const issue = filterResolution.issues[0];
+      const userValue = issue.filter.userValue || issue.filter.val;
+      const description = `${issue.filter.field} = "${userValue}"`;
+      if (issue.kind === 'ambiguous') {
+        const clarificationQuestion = `Which stored value should be used for ${description}? Candidates: ${issue.candidates.join(', ')}`;
+        await db.query(
+          `UPDATE clarity_app.analyses SET status = 'needs_clarification', summary = $1, clarification_question = $2 WHERE id = $3`,
+          [`Multiple stored values match ${description}.`, clarificationQuestion, analysis.id]
+        );
+        return res.json({
+          analysisId: analysis.id,
+          status: 'needs_clarification',
+          interpretation: { ...interpretation, status: 'needs_clarification', clarificationQuestion },
+          clarificationQuestion,
+          clarificationOptions: interpretation.clarificationOptions || [],
+        });
+      }
+      const message = `No stored value matches ${description}. The query was not generated.`;
+      await db.query(`UPDATE clarity_app.analyses SET status = 'unsupported', summary = $1 WHERE id = $2`, [message, analysis.id]);
+      return sendError(
+        res,
+        interpretation.operation === 'DELETE' || interpretation.operation === 'UPDATE' ? 422 : 404,
+        'VALUE_NOT_FOUND',
+        message
+      );
+    }
+    const resolvedInterpretation = filterResolution.interpretation;
+
     // 2. SQL generation & bounded correction
-    const genResult = await generateSqlWithCorrection(analysis.question, interpretation, tables);
+    const genResult = await generateSqlWithCorrection(analysis.question, resolvedInterpretation, tables);
+    console.log('[NL->SQL] validationResult=%j', {
+      question: analysis.question,
+      generatedSql: genResult.sql,
+      isValid: genResult.report.isValid,
+      errors: genResult.report.errors,
+      attempts: genResult.attempts.length,
+    });
+    const permissionAction = ({
+      SELECT: 'read',
+      INSERT: 'insert',
+      UPDATE: 'update',
+      DELETE: 'delete_records',
+      CREATE: 'admin_create_table',
+      ALTER: 'admin_alter_table',
+      DROP: 'admin_drop_table',
+      TRUNCATE: 'delete_records',
+      UNKNOWN: 'read',
+    } as const)[interpretation.operation];
+    const authorization = authorizeOperation(
+      req.user,
+      {
+        organizationId: analysis.organization_id,
+        databaseId: analysis.dataset_id,
+        databaseLifecycleState: analysis.lifecycle_state,
+      },
+      permissionAction
+    );
+    genResult.report.permissions = authorization.authorized
+      ? { status: 'passed', message: 'The authenticated user is authorized for this operation.' }
+      : { status: 'failed', message: authorization.reason || 'The authenticated user is not authorized for this operation.' };
+    if (!authorization.authorized) {
+      genResult.report.errors.push(genResult.report.permissions.message);
+      genResult.report.isValid = false;
+    }
 
     // Save attempts to clarity_app.sql_attempts
     for (const att of genResult.attempts) {
@@ -793,11 +951,30 @@ apiRouter.post('/analyses/:id/prepare', requireAuth, async (req: AuthRequest, re
     }
 
     if (!genResult.report.isValid) {
-      await db.query(
-        `UPDATE clarity_app.analyses SET status = 'failed', summary = $1 WHERE id = $2`,
-        [interpretation.summary, analysis.id]
-      );
-      return sendError(res, 422, 'VALIDATION_FAILED', `Generated SQL failed AST validation: ${genResult.report.errors.join('; ')}`);
+      const reason = authorization.authorized
+        ? `I couldn't confidently generate a valid query. ${genResult.report.errors[0] || 'The requested operation did not match the connected schema.'}`
+        : 'You do not have permission to perform this database operation.';
+      const suggestions = authorization.authorized
+        ? buildSmartSuggestions(analysis.question, tables, reason)
+        : [];
+      await db.query(`UPDATE clarity_app.analyses SET status = 'failed', intent_json = $1 WHERE id = $2`, [
+        JSON.stringify({ ...resolvedInterpretation, validation: { ...resolvedInterpretation.validation, reason, suggestions } }),
+        analysis.id,
+      ]);
+      return res.status(422).json({
+        error: {
+          code: authorization.authorized ? 'VALIDATION_FAILED' : 'UNAUTHORIZED_OPERATION',
+          message: reason,
+          retryable: false,
+          requestId: crypto.randomUUID(),
+        },
+        question: analysis.question,
+        operation: resolvedInterpretation.operation,
+        validation: genResult.report,
+        suggestions,
+        correctionAttempts: genResult.attempts.length,
+        ready_for_execution: false,
+      });
     }
 
     // 3. Create immutable preview
@@ -825,16 +1002,17 @@ apiRouter.post('/analyses/:id/prepare', requireAuth, async (req: AuthRequest, re
     // Update analysis status
     await db.query(
       `UPDATE clarity_app.analyses
-       SET status = 'ready_for_review', summary = $1, measure = $2, aggregation = $3,
-           group_by_json = $4, filters_json = $5, sort_json = $6
-       WHERE id = $7`,
+       SET status = 'ready_for_review', intent_json = $1, summary = $2, measure = $3, aggregation = $4,
+           group_by_json = $5, filters_json = $6, sort_json = $7
+       WHERE id = $8`,
       [
-        interpretation.summary,
-        interpretation.measure || null,
-        interpretation.aggregation || null,
-        JSON.stringify(interpretation.groupBy),
-        JSON.stringify(interpretation.filters),
-        JSON.stringify(interpretation.sort),
+        JSON.stringify(resolvedInterpretation),
+        resolvedInterpretation.summary,
+        resolvedInterpretation.measure || null,
+        resolvedInterpretation.aggregation || null,
+        JSON.stringify(resolvedInterpretation.groupBy),
+        JSON.stringify(resolvedInterpretation.filters),
+        JSON.stringify(resolvedInterpretation.sort),
         analysis.id,
       ]
     );
@@ -843,7 +1021,15 @@ apiRouter.post('/analyses/:id/prepare', requireAuth, async (req: AuthRequest, re
       analysisId: analysis.id,
       status: 'ready_for_review',
       message: 'Ready for your review. This query has not run.',
-      interpretation,
+      question: analysis.question,
+      interpretation: resolvedInterpretation,
+      relevantSchema: tables,
+      generatedSql: genResult.sql,
+      finalSql: genResult.sql,
+      validation: genResult.report,
+      correctionAttempts: genResult.attempts.length,
+      authorization: { authorized: true, operation: interpretation.operation },
+      ready_for_execution: true,
       preview: {
         id: previewId,
         sql: genResult.sql,
@@ -853,6 +1039,14 @@ apiRouter.post('/analyses/:id/prepare', requireAuth, async (req: AuthRequest, re
         validationReport: genResult.report,
         attemptsCount: genResult.attempts.length,
         attempts: genResult.attempts,
+        operation: resolvedInterpretation.operation,
+        valueResolutions: resolvedInterpretation.filters
+          .filter(filter => filter.resolvedValue && filter.userValue)
+          .map(filter => ({
+            field: filter.field,
+            userValue: filter.userValue!,
+            resolvedValue: filter.resolvedValue!,
+          })),
       },
     });
   } catch (err: any) {
@@ -919,6 +1113,13 @@ apiRouter.get('/analyses/:id', requireAuth, async (req: AuthRequest, res) => {
       digest: a.digest,
       validationReport: JSON.parse(a.validation_report_json || '{}'),
       isConsumed: a.is_consumed,
+      valueResolutions: (JSON.parse(a.intent_json || '{}').filters || [])
+        .filter((filter: any) => filter.userValue && filter.resolvedValue)
+        .map((filter: any) => ({
+          field: filter.field,
+          userValue: filter.userValue,
+          resolvedValue: filter.resolvedValue,
+        })),
     } : null,
     execution: a.execution_id ? {
       id: a.execution_id,
@@ -945,6 +1146,37 @@ apiRouter.post('/previews/:id/confirm', requireAuth, async (req: AuthRequest, re
   const { digest, idempotencyKey } = req.body;
 
   try {
+    const db = await getDb();
+    const previewRes = await db.query(
+      `SELECT p.validation_report_json, p.dataset_id, d.organization_id, d.lifecycle_state
+       FROM clarity_app.previews p
+       JOIN clarity_app.datasets d ON d.id = p.dataset_id
+       WHERE p.id = $1 AND p.owner_id = $2`,
+      [req.params.id, req.user!.id]
+    );
+    if (previewRes.rows.length > 0) {
+      const report = parseJsonColumn<any>(previewRes.rows[0].validation_report_json, {});
+      if (report.generatedOperation && report.generatedOperation !== 'SELECT') {
+        const action = ({
+          INSERT: 'insert',
+          UPDATE: 'update',
+          DELETE: 'delete_records',
+          SELECT: 'read',
+        } as const)[report.generatedOperation as 'INSERT' | 'UPDATE' | 'DELETE' | 'SELECT'];
+        const authCheck = authorizeOperation(
+          req.user,
+          {
+            organizationId: previewRes.rows[0].organization_id,
+            databaseId: previewRes.rows[0].dataset_id,
+            databaseLifecycleState: previewRes.rows[0].lifecycle_state,
+          },
+          action || 'read',
+        );
+        if (!authCheck.authorized) {
+          return sendError(res, authCheck.status, authCheck.code!, authCheck.reason!);
+        }
+      }
+    }
     const result = await confirmAndExecuteQuery(
       req.params.id,
       req.user!.id,
@@ -959,6 +1191,9 @@ apiRouter.post('/previews/:id/confirm', requireAuth, async (req: AuthRequest, re
     });
   } catch (err: any) {
     const status = err.code === 'PREVIEW_NOT_FOUND' ? 404 :
+                   err.code === 'INSUFFICIENT_PERMISSIONS' ||
+                   err.code === 'NO_DATABASE_ACCESS' ||
+                   err.code === 'READ_PERMISSION_REQUIRED' ? 403 :
                    err.code === 'SCHEMA_CHANGED' ? 409 :
                    err.code === 'PREVIEW_EXPIRED' ? 410 : 400;
 
@@ -1120,6 +1355,7 @@ apiRouter.get('/history', requireAuth, async (req: AuthRequest, res) => {
 
   let sql = `
     SELECT a.id, a.question, a.status, a.summary, a.created_at,
+           d.id as dataset_id,
            p.sql_text, p.digest,
            e.id as execution_id, e.status as execution_status, e.duration_ms, e.started_at,
            r.total_rows, r.is_capped,

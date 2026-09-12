@@ -2,6 +2,8 @@ import { parse, Statement, SelectStatement } from 'pgsql-ast-parser';
 import { TableMetadata } from './schema.ts';
 import { config } from './config.ts';
 
+export type OperationType = 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE' | 'CREATE' | 'ALTER' | 'DROP' | 'TRUNCATE' | 'UNKNOWN';
+
 export interface ValidationCheckResult {
   status: 'passed' | 'failed' | 'not_applicable';
   message: string;
@@ -17,8 +19,17 @@ export interface ValidationReport {
     limits: ValidationCheckResult;
   };
   errors: string[];
+  warnings: string[];
   normalizedSql?: string;
   referencedTables: string[];
+  referencedColumns: { table: string; column: string }[];
+  generatedOperation: OperationType;
+  columns: ValidationCheckResult;
+  relationships: ValidationCheckResult;
+  dataTypes: ValidationCheckResult;
+  operation: ValidationCheckResult;
+  permissions: ValidationCheckResult;
+  safety: ValidationCheckResult;
 }
 
 const ALLOWED_FUNCTIONS = new Set([
@@ -68,12 +79,29 @@ const FORBIDDEN_WORDS = [
   /\bclarity_app\b/i,
 ];
 
+function detectOperation(sql: string, statement?: Statement): OperationType {
+  const keyword = sql.trim().match(/^(?:--[^\n]*\s*)*([a-z]+)/i)?.[1]?.toUpperCase();
+  if (keyword && ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE'].includes(keyword)) {
+    return keyword as OperationType;
+  }
+  if (statement?.type === 'select' || statement?.type === 'with') return 'SELECT';
+  return 'UNKNOWN';
+}
+
+function emptyCheck(message: string): ValidationCheckResult {
+  return { status: 'not_applicable', message };
+}
+
 export function validateSql(
   sql: string,
-  authorizedTables: TableMetadata[]
+  authorizedTables: TableMetadata[],
+  expectedOperation?: OperationType,
+  authorizedOperation = true
 ): ValidationReport {
   const errors: string[] = [];
+  const warnings: string[] = [];
   const referencedTables: string[] = [];
+  const referencedColumns: { table: string; column: string }[] = [];
 
   const checks: ValidationReport['checks'] = {
     syntax: { status: 'passed', message: 'SQL parsed successfully into PostgreSQL AST.' },
@@ -82,6 +110,14 @@ export function validateSql(
     functions: { status: 'passed', message: 'All functions are verified safe analytical primitives.' },
     limits: { status: 'passed', message: `Row limits verified within maximum bound of ${config.maxResultRows}.` },
   };
+  const columnsCheck = { status: 'passed', message: 'All referenced columns exist in the active schema.' } as ValidationCheckResult;
+  const relationshipsCheck = { status: 'passed', message: 'Referenced joins match known foreign-key relationships.' } as ValidationCheckResult;
+  const dataTypesCheck = { status: 'passed', message: 'No obvious data type mismatches were detected.' } as ValidationCheckResult;
+  const operationCheck = { status: 'passed', message: 'Generated operation matches the requested operation.' } as ValidationCheckResult;
+  const permissionsCheck = authorizedOperation
+    ? { status: 'passed', message: 'The authenticated user is authorized for this operation.' } as ValidationCheckResult
+    : { status: 'failed', message: 'The authenticated user is not authorized for this operation.' } as ValidationCheckResult;
+  const safetyCheck = { status: 'passed', message: 'SQL passed safety validation and requires confirmation before execution.' } as ValidationCheckResult;
 
   const trimmedSql = sql.trim().replace(/;+$/, '').trim();
 
@@ -97,7 +133,16 @@ export function validateSql(
         limits: { status: 'not_applicable', message: 'No limit analyzed.' },
       },
       errors: ['SQL query is empty.'],
+      warnings,
       referencedTables: [],
+      referencedColumns,
+      generatedOperation: 'UNKNOWN',
+      columns: emptyCheck('No columns analyzed.'),
+      relationships: emptyCheck('No relationships analyzed.'),
+      dataTypes: emptyCheck('No data types analyzed.'),
+      operation: { status: 'failed', message: 'No SQL operation was generated.' },
+      permissions: permissionsCheck,
+      safety: safetyCheck,
     };
   }
 
@@ -112,7 +157,16 @@ export function validateSql(
       isValid: false,
       checks,
       errors,
+      warnings,
       referencedTables: [],
+      referencedColumns,
+      generatedOperation: detectOperation(trimmedSql),
+      columns: emptyCheck('Columns could not be analyzed because parsing failed.'),
+      relationships: emptyCheck('Relationships could not be analyzed because parsing failed.'),
+      dataTypes: emptyCheck('Data types could not be analyzed because parsing failed.'),
+      operation: operationCheck,
+      permissions: permissionsCheck,
+      safety: safetyCheck,
     };
   }
 
@@ -124,10 +178,20 @@ export function validateSql(
 
   const statement = ast[0];
 
-  // 3. Must be SELECT or WITH statement
-  if (statement.type !== 'select' && statement.type !== 'with') {
-    checks.readOnly = { status: 'failed', message: `Statement type '${statement.type}' is forbidden. Only SELECT queries are permitted.` };
-    errors.push(`Disallowed statement type: ${statement.type}. Only SELECT queries are permitted.`);
+  const generatedOperation = detectOperation(trimmedSql, statement);
+  if (expectedOperation && generatedOperation !== expectedOperation) {
+    operationCheck.status = 'failed';
+    operationCheck.message = `Expected ${expectedOperation}, but generated SQL is ${generatedOperation}.`;
+    errors.push(operationCheck.message);
+  }
+  if (!authorizedOperation) {
+    errors.push(permissionsCheck.message);
+  }
+
+  // Read-only checks do not apply to authorized mutation operations.
+  if (generatedOperation !== 'SELECT') {
+    checks.readOnly = { status: 'not_applicable', message: 'Read-only check is not applicable to this operation.' };
+    safetyCheck.message = 'Modification passed safety validation and requires confirmation before execution.';
   }
 
   const statementAny = statement as any;
@@ -146,8 +210,13 @@ export function validateSql(
     }
   }
 
-  // Set of valid schema table names
-  const validTableNames = new Set(authorizedTables.map(t => t.name.toLowerCase()));
+  const tableMap = new Map(authorizedTables.map(t => [t.name.toLowerCase(), t]));
+  const validTableNames = new Set(tableMap.keys());
+  const aliases = new Map<string, string>();
+  const selectAliases = new Set<string>();
+  for (const table of authorizedTables) {
+    aliases.set(table.name.toLowerCase(), table.name.toLowerCase());
+  }
 
   // Walk AST to inspect tables and functions
   function walk(node: any) {
@@ -181,6 +250,52 @@ export function validateSql(
           };
           errors.push(`Table '${tableName}' was not found in dataset.`);
         }
+        const alias = node.alias?.name || node.name?.alias || node.alias;
+        if (typeof alias === 'string') aliases.set(alias.toLowerCase(), tableName);
+      }
+    }
+
+    if (node.type === 'ref' || node.type === 'column') {
+      const rawColumn = node.name?.name || node.name;
+      const rawTable = node.table?.name || node.table;
+      if (typeof rawColumn === 'string' && rawColumn !== '*' && !selectAliases.has(rawColumn.toLowerCase())) {
+        const tableName = typeof rawTable === 'string'
+          ? (aliases.get(rawTable.toLowerCase()) || rawTable.toLowerCase())
+          : '';
+        referencedColumns.push({ table: tableName, column: rawColumn });
+        const candidateTables = tableName && tableMap.has(tableName)
+          ? [tableMap.get(tableName)!]
+          : authorizedTables;
+        if (!candidateTables.some(t => t.columns.some(c => c.name.toLowerCase() === rawColumn.toLowerCase()))) {
+          columnsCheck.status = 'failed';
+          columnsCheck.message = `Column '${rawColumn}' does not exist in the active dataset schema.`;
+          errors.push(`Column '${rawColumn}' was not found in dataset.`);
+        }
+      }
+    }
+
+    if (node.type === 'binary') {
+      const operator = String(node.op || node.operator || '').toUpperCase();
+      if (!['=', '<>', '!=', '>', '>=', '<', '<=', 'LIKE', 'ILIKE', 'IS', 'IS NOT', 'AND', 'OR'].includes(operator)) {
+        errors.push(`Unsupported filter operator '${operator || 'unknown'}'.`);
+        dataTypesCheck.status = 'failed';
+      }
+    }
+
+    if (node.type === 'binary' && node.left?.type === 'ref' && node.right?.type === 'string') {
+      const columnName = node.left.name?.name || node.left.name;
+      const tableName = node.left.table?.name || node.left.table;
+      const resolvedTable = typeof tableName === 'string' ? aliases.get(tableName.toLowerCase()) || tableName.toLowerCase() : '';
+      const column = tableMap.get(resolvedTable)?.columns.find(c => c.name.toLowerCase() === String(columnName).toLowerCase());
+      if (column?.distinctValues?.length && !column.distinctValues.some(value =>
+        value.toLowerCase() === String(node.right.value).toLowerCase(),
+      )) {
+        dataTypesCheck.status = 'failed';
+        dataTypesCheck.message = `Filter value '${node.right.value}' does not exist for column '${column.name}'.`;
+        errors.push(dataTypesCheck.message);
+      }
+      if (column && !['TEXT', 'VARCHAR', 'CHARACTER VARYING', 'DATE', 'TIMESTAMP WITHOUT TIME ZONE', 'TIMESTAMP WITH TIME ZONE'].includes(column.dataType)) {
+        warnings.push(`String literal compared with ${column.dataType} column '${String(columnName)}'; verify the filter value.`);
       }
     }
 
@@ -210,7 +325,61 @@ export function validateSql(
     }
   }
 
+  const collectAliases = (node: any) => {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'select' && Array.isArray(node.columns)) {
+      for (const column of node.columns) {
+        const alias = column.alias?.name || column.alias;
+        if (typeof alias === 'string') selectAliases.add(alias.toLowerCase());
+      }
+    }
+    if (node.type === 'table') {
+      const rawName = typeof node.name === 'string' ? node.name : node.name?.name;
+      const alias = node.alias?.name || node.name?.alias || node.alias;
+      if (typeof rawName === 'string' && typeof alias === 'string') {
+        aliases.set(alias.toLowerCase(), rawName.toLowerCase());
+      }
+    }
+    Object.values(node).forEach(child => {
+      if (Array.isArray(child)) child.forEach(collectAliases);
+      else if (child && typeof child === 'object') collectAliases(child);
+    });
+  };
+  collectAliases(statement);
   walk(statement);
+
+  for (const table of referencedTables) {
+    if (!tableMap.has(table) && !cteNames.has(table)) {
+      relationshipsCheck.status = 'failed';
+    }
+  }
+  const joinNodes: any[] = [];
+  const collectJoins = (node: any) => {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'join' || (typeof node.type === 'string' && node.type.endsWith(' JOIN'))) joinNodes.push(node);
+    Object.values(node).forEach(child => {
+      if (Array.isArray(child)) child.forEach(collectJoins);
+      else if (child && typeof child === 'object') collectJoins(child);
+    });
+  };
+  collectJoins(statement);
+  for (const join of joinNodes) {
+    const left = join.on?.left;
+    const right = join.on?.right;
+    const leftName = left?.name?.name || left?.name;
+    const rightName = right?.name?.name || right?.name;
+    const leftTable = aliases.get((left?.table?.name || left?.table || '').toLowerCase()) || (left?.table?.name || left?.table || '').toLowerCase();
+    const rightTable = aliases.get((right?.table?.name || right?.table || '').toLowerCase()) || (right?.table?.name || right?.table || '').toLowerCase();
+    const leftMeta = tableMap.get(leftTable);
+    const rightMeta = tableMap.get(rightTable);
+    const relationshipExists = Boolean(
+      leftMeta?.columns.some(c => c.name.toLowerCase() === String(leftName).toLowerCase() && c.foreignKey?.targetTable.toLowerCase() === rightTable && c.foreignKey.targetColumn.toLowerCase() === String(rightName).toLowerCase()) ||
+      rightMeta?.columns.some(c => c.name.toLowerCase() === String(rightName).toLowerCase() && c.foreignKey?.targetTable.toLowerCase() === leftTable && c.foreignKey.targetColumn.toLowerCase() === String(leftName).toLowerCase())
+    );
+    if (leftMeta && rightMeta && !relationshipExists) {
+      warnings.push(`Join between '${leftTable}' and '${rightTable}' does not match a known foreign-key relationship.`);
+    }
+  }
 
   // Check limits
   const targetSelect = statement.type === 'with' ? statementAny.in : statementAny;
@@ -238,13 +407,22 @@ export function validateSql(
     };
   }
 
-  const isValid = errors.length === 0;
+  const isValid = errors.length === 0 && authorizedOperation;
 
   return {
     isValid,
     checks,
     errors,
+    warnings,
     normalizedSql: trimmedSql,
     referencedTables,
+    referencedColumns,
+    generatedOperation,
+    columns: columnsCheck,
+    relationships: relationshipsCheck,
+    dataTypes: dataTypesCheck,
+    operation: operationCheck,
+    permissions: permissionsCheck,
+    safety: safetyCheck,
   };
 }

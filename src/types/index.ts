@@ -156,25 +156,78 @@ export interface ValidationReport {
   };
   errors: string[];
   referencedTables: string[];
+  warnings?: string[];
+  referencedColumns?: { table: string; column: string }[];
+  generatedOperation?: OperationType;
+  operation?: ValidationCheckResult;
+  columns?: ValidationCheckResult;
+  relationships?: ValidationCheckResult;
+  dataTypes?: ValidationCheckResult;
+  permissions?: ValidationCheckResult;
+  safety?: ValidationCheckResult;
 }
 
 export interface SqlAttempt {
   attemptNumber: number;
   sql: string;
-  report: ValidationReport;
+  report: SQLValidationReport;
   correctionReason?: string;
 }
 
+export type OperationType = 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE' | 'CREATE' | 'ALTER' | 'DROP' | 'TRUNCATE' | 'UNKNOWN';
+
+export interface QuestionValidationResult {
+  status: 'valid' | 'needs_clarification' | 'out_of_scope' | 'unsupported';
+  reason?: string;
+  suggestions?: string[];
+}
+
 export interface QuestionInterpretation {
-  status: 'ready' | 'needs_clarification' | 'unsupported';
+  status: 'ready' | 'needs_clarification' | 'unsupported' | 'out_of_scope';
+  validation: QuestionValidationResult;
+  operation: OperationType;
   summary: string;
+  intent?: {
+    targetEntities: string[];
+    metrics: string[];
+    filters: { field: string; operator: string; value: string | number }[];
+    groupBy: string[];
+    sort: { field: string; direction: 'asc' | 'desc' }[];
+    limit?: number;
+  };
   measure?: string | null;
   aggregation?: string | null;
   groupBy: string[];
-  filters: { field: string; op: string; val: string }[];
+  filters: { field: string; op: string; val: string; userValue?: string; resolvedValue?: string }[];
   sort: { field: string; direction: 'asc' | 'desc' }[];
   requestedLimit?: number | null;
   clarificationQuestion?: string | null;
+  clarificationOptions?: string[];
+}
+
+export interface SQLValidationReport {
+  isValid: boolean;
+  checks: {
+    syntax: ValidationCheckResult;
+    readOnly: ValidationCheckResult;
+    objects: ValidationCheckResult;
+    functions: ValidationCheckResult;
+    limits: ValidationCheckResult;
+  };
+  syntax: ValidationCheckResult;
+  tables: ValidationCheckResult;
+  columns: ValidationCheckResult;
+  relationships: ValidationCheckResult;
+  dataTypes: ValidationCheckResult;
+  operation: ValidationCheckResult;
+  permissions: ValidationCheckResult;
+  safety: ValidationCheckResult;
+  errors: string[];
+  warnings: string[];
+  correctionAttempts: number;
+  referencedTables: string[];
+  referencedColumns: { table: string; column: string }[];
+  generatedOperation: OperationType;
 }
 
 export interface QueryPreview {
@@ -183,10 +236,12 @@ export interface QueryPreview {
   params: any[];
   resultLimit: number;
   digest: string;
-  validationReport: ValidationReport;
+  validationReport: SQLValidationReport;
   attemptsCount?: number;
   attempts?: SqlAttempt[];
   isConsumed?: boolean;
+  operation: OperationType;
+  valueResolutions?: { field: string; userValue: string; resolvedValue: string }[];
 }
 
 export interface GroundedInsight {
@@ -195,6 +250,7 @@ export interface GroundedInsight {
   evidence: string[];
   chartRecommendation: {
     type: 'bar' | 'line' | 'donut' | 'scatter' | 'value_card' | 'table';
+    visualizationNeeded: boolean;
     xAxisKey?: string;
     yAxisKey?: string;
     seriesKey?: string;
@@ -250,6 +306,7 @@ export interface HistoryItem {
   started_at?: string;
   total_rows?: number;
   is_capped?: boolean;
+  dataset_id?: string;
   dataset_name?: string;
 }
 
@@ -280,4 +337,16 @@ export interface CsvUploadInfo {
   }[];
   previewRows: Record<string, any>[];
   issues: { row?: number; column?: string; message: string; severity: 'warning' | 'error' }[];
+  profile?: {
+    rows: number;
+    columns: number;
+    duplicateRows: number;
+    emptyColumns: string[];
+    warnings: string[];
+    profilingMs: number;
+  };
+  semanticAnalysis?: {
+    status: 'available' | 'unavailable';
+    warnings: string[];
+  };
 }

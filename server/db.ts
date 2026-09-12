@@ -19,6 +19,7 @@ export interface QueryResultRow {
 export interface DatabaseAdapter {
   query<R extends QueryResultRow = any>(sql: string, params?: any[]): Promise<{ rows: R[]; rowCount: number; fields?: { name: string; dataTypeID?: number }[] }>;
   exec(sql: string): Promise<void>;
+  queryInSchema<R extends QueryResultRow = any>(schema: string, sql: string, params?: any[]): Promise<{ rows: R[]; rowCount: number; fields?: { name: string; dataTypeID?: number }[] }>;
   close(): Promise<void>;
   isReady(): boolean;
   getEngine(): string;
@@ -52,6 +53,15 @@ class PgliteAdapter implements DatabaseAdapter {
 
   async exec(sql: string) {
     await this.pglite.exec(sql);
+  }
+
+  async queryInSchema<R extends QueryResultRow = any>(schema: string, sql: string, params?: any[]) {
+    await this.pglite.exec(`SET search_path TO "${schema}";`);
+    try {
+      return await this.query<R>(sql, params);
+    } finally {
+      await this.pglite.exec('RESET search_path;');
+    }
   }
 
   async close() {
@@ -90,6 +100,26 @@ class PgPoolAdapter implements DatabaseAdapter {
 
   async exec(sql: string) {
     await this.pool.query(sql);
+  }
+
+  async queryInSchema<R extends QueryResultRow = any>(schema: string, sql: string, params?: any[]) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SET LOCAL search_path TO "${schema}"`);
+      const res = await client.query(sql, params);
+      await client.query('COMMIT');
+      return {
+        rows: res.rows as R[],
+        rowCount: res.rowCount || res.rows.length,
+        fields: res.fields?.map(f => ({ name: f.name, dataTypeID: f.dataTypeID })),
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   async close() {
