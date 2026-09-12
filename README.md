@@ -70,7 +70,7 @@ GEMINI_API_KEY="your-gemini-api-key"
 DATABASE_URL="postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres"
 
 # Optional: Gemini model override
-GEMINI_MODEL="gemini-2.0-flash"
+GEMINI_MODEL="gemini-3.6-flash"
 ```
 
 > **Supabase tip:** Use the **Transaction Pooler** string (port `6543`) — not the direct connection — for full IPv4 compatibility.
@@ -190,7 +190,7 @@ Migrations run automatically on every server startup — no manual SQL needed.
 |---|---|---|
 | `DATABASE_URL` | ✅ | PostgreSQL connection string |
 | `GEMINI_API_KEY` | ✅ | Google Gemini API key |
-| `GEMINI_MODEL` | Optional | Model name (default: `gemini-2.0-flash`) |
+| `GEMINI_MODEL` | Optional | Model name (default: `gemini-3.6-flash`) |
 | `NODE_ENV` | Optional | Set to `production` for production builds |
 | `MAX_CSV_BYTES` | Optional | Max upload size in bytes (default: 25 MB) |
 | `QUERY_TIMEOUT_MS` | Optional | SQL query timeout (default: 15 s) |

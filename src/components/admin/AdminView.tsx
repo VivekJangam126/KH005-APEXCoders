@@ -12,7 +12,6 @@ import {
   CheckCircle2,
   XCircle,
   AlertCircle,
-  Clock,
   Search,
   Filter,
   RefreshCw,
@@ -33,7 +32,7 @@ export function AdminView() {
   const { user, refreshUser } = useAuth();
   const { datasets, refreshDatasets } = useData();
 
-  const [activeTab, setActiveTab] = useState<'requests' | 'members' | 'permissions' | 'audit' | 'settings'>('requests');
+  const [activeTab, setActiveTab] = useState<'members' | 'permissions' | 'audit' | 'settings'>('members');
   const [orgDetails, setOrgDetails] = useState<any>(null);
   const [auditLogs, setAuditLogs] = useState<AuditEvent[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -93,9 +92,9 @@ export function AdminView() {
           limit: 100,
         }),
       ]);
-      setOrgDetails(details);
-      setAuditLogs(auditRes.auditLogs || []);
-      setNewOrgName(details.organization?.name || '');
+      setOrgDetails(details.organization || details);
+      setAuditLogs(auditRes.logs || []);
+      setNewOrgName((details.organization || details).name || '');
 
       // Pre-select first non-admin member and dataset for permissions tab
       const firstMember = details.members?.find((m: any) => m.role === 'MEMBER');
@@ -245,8 +244,8 @@ export function AdminView() {
     } catch {}
   };
 
-  const pendingRequests = orgDetails?.members?.filter((m: any) => m.status === 'PENDING') || [];
-  const activeMembers = orgDetails?.members?.filter((m: any) => m.status !== 'PENDING') || [];
+  const allMembers = orgDetails?.members || [];
+  const activeMembers = allMembers.filter((m: any) => m.status !== 'PENDING');
 
 
   return (
@@ -264,7 +263,7 @@ export function AdminView() {
             </span>
           </div>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            Manage member access requests, grant granular database permissions, and inspect immutable audit trails
+            Manage members, database permissions, and immutable audit trails
           </p>
         </div>
 
@@ -312,13 +311,13 @@ export function AdminView() {
 
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 shadow-sm">
           <div className="flex items-center justify-between">
-            <span className="text-xs text-slate-500 font-medium">Pending Requests</span>
-            <Clock className="w-4 h-4 text-amber-500" />
+            <span className="text-xs text-slate-500 font-medium">Total Members</span>
+              <Users className="w-4 h-4 text-indigo-500" />
           </div>
           <p className="text-xl font-bold text-amber-600 dark:text-amber-400 mt-1">
-            {pendingRequests.length}
+            {isLoading ? '—' : allMembers.length}
           </p>
-          <p className="text-[11px] text-slate-400">Awaiting review</p>
+          <p className="text-[11px] text-slate-400">Current organization members</p>
         </div>
 
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 shadow-sm">
@@ -327,7 +326,7 @@ export function AdminView() {
             <Users className="w-4 h-4 text-indigo-500" />
           </div>
           <p className="text-xl font-bold text-slate-900 dark:text-white mt-1">
-            {activeMembers.length}
+            {isLoading ? '—' : activeMembers.length}
           </p>
           <p className="text-[11px] text-slate-400">Active in tenant</p>
         </div>
@@ -338,7 +337,7 @@ export function AdminView() {
             <Database className="w-4 h-4 text-purple-500" />
           </div>
           <p className="text-xl font-bold text-slate-900 dark:text-white mt-1">
-            {datasets.length}
+            {isLoading ? '—' : (orgDetails?.datasets?.length ?? datasets.length)}
           </p>
           <p className="text-[11px] text-slate-400">Protected by RBAC</p>
         </div>
@@ -346,24 +345,6 @@ export function AdminView() {
 
       {/* Tab Navigation */}
       <div className="flex border-b border-slate-200 dark:border-slate-800 gap-2 overflow-x-auto">
-        <button
-          id="admin-tab-requests"
-          onClick={() => setActiveTab('requests')}
-          className={`flex items-center gap-2 pb-3 px-3 text-xs font-semibold border-b-2 transition-colors whitespace-nowrap ${
-            activeTab === 'requests'
-              ? 'border-purple-600 text-purple-600 dark:text-purple-400 dark:border-purple-400'
-              : 'border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
-          }`}
-        >
-          <Clock className="w-4 h-4" />
-          <span>Access Requests</span>
-          {pendingRequests.length > 0 && (
-            <span className="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-amber-500 text-white">
-              {pendingRequests.length}
-            </span>
-          )}
-        </button>
-
         <button
           id="admin-tab-members"
           onClick={() => setActiveTab('members')}
@@ -417,82 +398,7 @@ export function AdminView() {
         </button>
       </div>
 
-      {/* Tab 1: Access Requests */}
-      {activeTab === 'requests' && (
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-sm overflow-hidden">
-          <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
-            <div>
-              <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-                Pending Member Access Requests
-              </h3>
-              <p className="text-xs text-slate-500">
-                Approve or reject requests from users seeking access to {orgDetails?.organization?.name}
-              </p>
-            </div>
-            <span className="text-xs text-slate-400 font-mono">
-              {pendingRequests.length} pending
-            </span>
-          </div>
-
-          {pendingRequests.length === 0 ? (
-            <div className="p-12 text-center text-slate-500 dark:text-slate-400">
-              <CheckCircle2 className="w-10 h-10 text-emerald-500 mx-auto mb-3 opacity-80" />
-              <p className="text-sm font-semibold text-slate-900 dark:text-white">All caught up!</p>
-              <p className="text-xs mt-1">No pending member access requests at this time.</p>
-            </div>
-          ) : (
-            <div className="divide-y divide-slate-100 dark:divide-slate-800">
-              {pendingRequests.map((req: any) => (
-                <div key={req.id} className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-slate-50/50 dark:hover:bg-slate-850/50 transition-colors">
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2">
-                      <span className="font-semibold text-xs text-slate-900 dark:text-white">
-                        {req.userName}
-                      </span>
-                      <span className="text-xs text-slate-500">({req.userEmail})</span>
-                      <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
-                        {req.role}
-                      </span>
-                    </div>
-
-                    {req.note && (
-                      <p className="text-xs text-slate-600 dark:text-slate-400 italic">
-                        "{req.note}"
-                      </p>
-                    )}
-
-                    <div className="flex items-center gap-3 text-[11px] text-slate-400">
-                      <span>Submitted: {new Date(req.requestedAt).toLocaleString()}</span>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      id={`reject-request-${req.id}-btn`}
-                      onClick={() => setRejectModalMembership(req)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 dark:border-rose-900/60 bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 hover:bg-rose-100 text-xs font-medium transition-colors"
-                    >
-                      <XCircle className="w-3.5 h-3.5" />
-                      <span>Reject</span>
-                    </button>
-
-                    <button
-                      id={`approve-request-${req.id}-btn`}
-                      onClick={() => handleStatusChange(req.id, 'APPROVED')}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold transition-colors shadow-sm"
-                    >
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                      <span>Approve Access</span>
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Tab 2: Members & Roles */}
+      {/* Tab 1: Members & Roles */}
       {activeTab === 'members' && (
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-sm overflow-hidden">
           <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex flex-col gap-4">
@@ -991,7 +897,7 @@ export function AdminView() {
                 rows={3}
                 value={rejectionReason}
                 onChange={e => setRejectionReason(e.target.value)}
-                placeholder="e.g. Unverified corporate email, or access should be requested via Department Lead."
+                placeholder="Reason for the status change"
                 className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-3 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-rose-500"
               />
             </div>

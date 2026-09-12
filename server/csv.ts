@@ -9,7 +9,30 @@ function detectDelimiter(sample: string): string {
   for (const ch of line) {
     if (ch in counts) counts[ch]++;
   }
+
   return Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+}
+
+function detectHeaderRow(records: string[][]): number {
+  const candidates = Math.min(records.length - 1, 10);
+  let bestIndex = 0;
+  let bestScore = -Infinity;
+  for (let index = 0; index < candidates; index++) {
+    const row = records[index] || [];
+    const next = records[index + 1] || [];
+    const values = row.map(value => String(value ?? '').trim()).filter(Boolean);
+    if (values.length < 2) continue;
+    const uniqueCount = new Set(values.map(value => value.toLowerCase())).size;
+    const placeholderPenalty = values.filter(value => /^column[_ ]?\d+$/i.test(value)).length * 4;
+    const numericPenalty = values.filter(value => /^-?\d+(\.\d+)?$/.test(value)).length * 2;
+    const nextValues = next.filter(value => String(value ?? '').trim() !== '').length;
+    const score = values.length * 2 + uniqueCount + Math.min(nextValues, values.length) - placeholderPenalty - numericPenalty;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
 }
 
 export interface ColumnInference {
@@ -70,8 +93,9 @@ export function parseAndValidateCsv(buffer: Buffer, originalFilename: string): C
     throw new Error('The uploaded CSV file is empty.');
   }
 
-  const rawHeaders = rawRecords[0];
-  const dataRows = rawRecords.slice(1);
+  const headerRowIndex = detectHeaderRow(rawRecords);
+  const rawHeaders = rawRecords[headerRowIndex];
+  const rawDataRows = rawRecords.slice(headerRowIndex + 1);
 
   if (rawHeaders.length === 0) {
     throw new Error('The uploaded CSV file has no columns or headers.');
@@ -81,13 +105,48 @@ export function parseAndValidateCsv(buffer: Buffer, originalFilename: string): C
     throw new Error(`CSV exceeds maximum column limit of 200 (found ${rawHeaders.length}).`);
   }
 
-  if (dataRows.length > 100000) {
-    throw new Error(`CSV exceeds maximum row limit of 100,000 (found ${dataRows.length}).`);
+  if (rawDataRows.length > 100000) {
+    throw new Error(`CSV exceeds maximum row limit of 100,000 (found ${rawDataRows.length}).`);
   }
+
+  // Remove malformed rows with values beyond the header and completely empty rows.
+  // These otherwise survive relaxed parsing and fail later when PostgreSQL inserts them.
+  const dataRows = rawDataRows
+    .filter((row, rowIndex) => {
+      const extraValues = row.slice(rawHeaders.length);
+      if (extraValues.some(value => String(value ?? '').trim() !== '')) {
+        issues.push({
+          row: rowIndex + 2,
+          message: 'Row has more values than the header and was removed.',
+          severity: 'warning',
+        });
+        return false;
+      }
+      return row.slice(0, rawHeaders.length).some(value => {
+        const normalized = String(value ?? '').trim().toLowerCase();
+        return normalized !== '' && normalized !== 'null' && normalized !== 'n/a';
+      });
+    })
+    .map(row => row.slice(0, rawHeaders.length));
+
+  // Drop columns that contain no usable values in any retained row.
+  const activeIndexes = rawHeaders
+    .map((_, index) => index)
+    .filter(index => dataRows.some(row => {
+      const normalized = String(row[index] ?? '').trim().toLowerCase();
+      return normalized !== '' && normalized !== 'null' && normalized !== 'n/a';
+    }));
+
+  if (activeIndexes.length === 0) {
+    throw new Error('The uploaded file contains no usable rows or columns.');
+  }
+
+  const filteredHeaders = activeIndexes.map(index => rawHeaders[index]);
+  const filteredDataRows = dataRows.map(row => activeIndexes.map(index => row[index]));
 
   // Sanitize headers and detect duplicate headers
   const seenHeaders = new Map<string, number>();
-  const columns: ColumnInference[] = rawHeaders.map((header, idx) => {
+  const columns: ColumnInference[] = filteredHeaders.map((header, idx) => {
     let raw = (header || '').trim();
     if (!raw) {
       raw = `column_${idx + 1}`;
@@ -117,8 +176,8 @@ export function parseAndValidateCsv(buffer: Buffer, originalFilename: string): C
   const hasNulls = columns.map(() => false);
   const sampleValues: any[][] = columns.map(() => []);
 
-  for (let r = 0; r < dataRows.length; r++) {
-    const row = dataRows[r];
+  for (let r = 0; r < filteredDataRows.length; r++) {
+    const row = filteredDataRows[r];
     for (let c = 0; c < columns.length; c++) {
       const val = row[c] !== undefined ? String(row[c]).trim() : '';
       if (val === '' || val.toLowerCase() === 'null' || val.toLowerCase() === 'n/a') {
@@ -201,8 +260,8 @@ export function parseAndValidateCsv(buffer: Buffer, originalFilename: string): C
   const allRows: Record<string, any>[] = [];
   const previewRows: Record<string, any>[] = [];
 
-  for (let r = 0; r < dataRows.length; r++) {
-    const row = dataRows[r];
+  for (let r = 0; r < filteredDataRows.length; r++) {
+    const row = filteredDataRows[r];
     const rowObj: Record<string, any> = {};
     for (let c = 0; c < columns.length; c++) {
       const col = columns[c];
@@ -244,7 +303,8 @@ export async function createAndPopulateTable(
   schema: string,
   tableName: string,
   columns: ColumnInference[],
-  rows: Record<string, any>[]
+  rows: Record<string, any>[],
+  onProgress?: (completedRows: number, totalRows: number) => void
 ): Promise<{ rowCount: number }> {
   // Ensure schema exists
   await db.exec(`CREATE SCHEMA IF NOT EXISTS "${schema}";`);
@@ -277,6 +337,7 @@ export async function createAndPopulateTable(
         `INSERT INTO "${schema}"."${tableName}" (${colNames}) VALUES (${placeholders})`,
         values
       );
+      onProgress?.(Math.min(i + batch.indexOf(row) + 1, rows.length), rows.length);
     }
   }
 

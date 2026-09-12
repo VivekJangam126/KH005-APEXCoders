@@ -6,6 +6,7 @@ import mammoth from 'mammoth';
 import { parseAndValidateCsv, sanitizeIdentifier } from './csv.ts';
 import { geminiDocumentExtraction } from './gemini.ts';
 import { config } from './config.ts';
+import { DatasetProfile, profileDataset } from './profiler.ts';
 
 export type IngestionOutcome =
   | 'READY_FOR_REVIEW'
@@ -33,6 +34,7 @@ export interface IngestionJob {
   inferredTypes: Record<string, any>;
   totalRowsPerTable: Record<string, number>;
   issues: Issue[];
+  profile?: DatasetProfile;
   transformations: any[];
   sourceReferences: Record<string, any>;
   proposedRelationships: any[];
@@ -57,6 +59,13 @@ export interface CandidateTable {
   rows: Record<string, any>[];
   rowCount: number;
   issues: Issue[];
+  profile?: DatasetProfile;
+  semanticAnalysis?: {
+    status: 'available' | 'unavailable';
+    columns: { name: string; semanticName?: string; description?: string; role?: string; confidence?: number }[];
+    relationships: unknown[];
+    warnings: string[];
+  };
 }
 
 export interface Issue {
@@ -65,6 +74,32 @@ export interface Issue {
   column?: string;
   message: string;
   severity: 'warning' | 'error';
+}
+
+function formatExtractionError(error: unknown): string {
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  let providerError: any = null;
+
+  try {
+    providerError = JSON.parse(rawMessage);
+  } catch {
+    providerError = null;
+  }
+
+  const providerMessage = providerError?.error?.message || providerError?.message;
+  const providerCode = providerError?.error?.code || providerError?.code;
+  const providerStatus = providerError?.error?.status || providerError?.status;
+
+  if (providerCode === 401 || providerStatus === 'UNAUTHENTICATED' ||
+      providerError?.error?.details?.some((detail: any) => detail?.reason === 'ACCESS_TOKEN_TYPE_UNSUPPORTED')) {
+    return 'AI document extraction could not authenticate. Please verify the Gemini API key configuration and try again.';
+  }
+
+  if (providerMessage) {
+    return `AI document extraction failed: ${providerMessage}`;
+  }
+
+  return rawMessage || 'Unknown document extraction error.';
 }
 
 export class DocumentIngestionAgent {
@@ -164,6 +199,7 @@ export class DocumentIngestionAgent {
     const csvResult = parseAndValidateCsv(buffer, originalFilename);
     const tableId = sanitizeIdentifier(path.basename(originalFilename, path.extname(originalFilename)));
     
+    const profile = profileDataset(csvResult.allRows, csvResult.columns, originalFilename);
     job.candidateTables.push({
       id: tableId,
       name: tableId,
@@ -171,6 +207,7 @@ export class DocumentIngestionAgent {
       rows: csvResult.allRows,
       rowCount: csvResult.totalRows,
       issues: csvResult.issues,
+      profile,
     });
     job.totalRowsPerTable[tableId] = csvResult.totalRows;
     job.selectedTables.push(tableId);
@@ -185,38 +222,76 @@ export class DocumentIngestionAgent {
       // Use header:1 to get raw arrays so we can detect title/header rows ourselves
       const rawRows: any[][] = xlsx.utils.sheet_to_json(sheet, { header: 1, defval: null, raw: false });
 
-      // Skip completely empty rows at the top to find the header row
+      // Skip empty/title rows and choose the first row that resembles real headers.
       let headerRowIdx = 0;
-      while (headerRowIdx < rawRows.length && rawRows[headerRowIdx].every((v: any) => v === null || v === '')) {
-        headerRowIdx++;
+      let bestScore = -Infinity;
+      const candidateLimit = Math.min(rawRows.length - 1, 10);
+      for (let index = 0; index < candidateLimit; index++) {
+        const values = rawRows[index].map((value: any) => String(value ?? '').trim()).filter(Boolean);
+        const nextValues = rawRows[index + 1].filter((value: any) => value !== null && String(value).trim() !== '').length;
+        if (values.length < 2) continue;
+        const uniqueCount = new Set(values.map(value => value.toLowerCase())).size;
+        const placeholderPenalty = values.filter(value => /^column[_ ]?\d+$/i.test(value)).length * 4;
+        const numericPenalty = values.filter(value => /^-?\d+(\.\d+)?$/.test(value)).length * 2;
+        const score = values.length * 2 + uniqueCount + Math.min(nextValues, values.length) - placeholderPenalty - numericPenalty;
+        if (score > bestScore) {
+          bestScore = score;
+          headerRowIdx = index;
+        }
       }
       if (headerRowIdx >= rawRows.length) continue;
 
       const headerRow = rawRows[headerRowIdx];
       const dataRows = rawRows.slice(headerRowIdx + 1).filter(
-        (r: any[]) => r.some((v: any) => v !== null && v !== '')
+        (r: any[]) => r.some((v: any) => v !== null && String(v).trim() !== '')
       );
 
       if (dataRows.length === 0) continue;
 
       const tableId = sanitizeIdentifier(sheetName);
-      const cols = headerRow.map((k: any, idx: number) => ({
-        originalName: String(k ?? `column_${idx + 1}`),
-        internalName: sanitizeIdentifier(String(k ?? '')) || `col_${idx}`,
-        detectedType: 'TEXT' as const,
-        isNullable: true,
-      }));
+      const activeIndexes = headerRow
+        .map((_: any, idx: number) => idx)
+        .filter((idx: number) => dataRows.some((row: any[]) => {
+          const value = row[idx];
+          return value !== null && value !== undefined && String(value).trim() !== '';
+        }));
+
+      if (activeIndexes.length === 0) continue;
+
+      const seenNames = new Map<string, number>();
+      const cols = activeIndexes.map((sourceIndex: number, idx: number) => {
+        const originalName = String(headerRow[sourceIndex] ?? `column_${idx + 1}`).trim() || `column_${idx + 1}`;
+        const baseName = sanitizeIdentifier(originalName) || `col_${idx + 1}`;
+        const count = seenNames.get(baseName) || 0;
+        seenNames.set(baseName, count + 1);
+        const internalName = count === 0 ? baseName : `${baseName}_${count + 1}`.substring(0, 60);
+        if (count > 0) {
+          job.issues.push({
+            tableId,
+            column: originalName,
+            message: `Duplicate Excel header was renamed to '${internalName}'.`,
+            severity: 'warning',
+          });
+        }
+        return {
+          originalName,
+          internalName,
+          detectedType: 'TEXT' as const,
+          isNullable: true,
+        };
+      });
 
       const parsedRows = dataRows.map((r: any[]) => {
         const nr: any = {};
         for (let i = 0; i < cols.length; i++) {
-          const v = r[i];
+          const v = r[activeIndexes[i]];
           // Preserve null/undefined as null; convert everything else to string for TEXT columns
-          nr[cols[i].internalName] = (v === null || v === undefined || v === '') ? null : v;
+          nr[cols[i].internalName] = (v === null || v === undefined || String(v).trim() === '') ? null : v;
         }
         return nr;
       });
 
+      const profile = profileDataset(parsedRows, cols, sheetName);
       job.candidateTables.push({
         id: tableId,
         name: sheetName,
@@ -224,15 +299,18 @@ export class DocumentIngestionAgent {
         rows: parsedRows,
         rowCount: parsedRows.length,
         issues: [],
+        profile,
       });
       job.totalRowsPerTable[tableId] = parsedRows.length;
       job.selectedTables.push(tableId);
     }
+
     if (job.candidateTables.length === 0) {
       job.extractionStatus = 'NOT_TABULAR';
       job.issues.push({ message: 'No tabular data found in Excel sheets.', severity: 'warning' });
     }
   }
+
 
   private static async processJson(buffer: Buffer, job: IngestionJob) {
     let data: any;
@@ -419,7 +497,7 @@ export class DocumentIngestionAgent {
       job.extractionStatus = 'PROCESSING_FAILED';
       const fmt = path.extname(filename).toUpperCase().replace('.', '') || 'text';
       job.issues.push({
-        message: `${fmt} AI extraction failed: ${e.message}`,
+        message: `${fmt} extraction failed: ${formatExtractionError(e)}`,
         severity: 'error',
       });
     }
@@ -457,7 +535,7 @@ export class DocumentIngestionAgent {
       // Report the actual format in the error, not "CSV"
       const fmt = path.extname(filename).toUpperCase().replace('.', '') || 'document';
       job.issues.push({
-        message: `${fmt} extraction failed: ${e.message}`,
+        message: `${fmt} extraction failed: ${formatExtractionError(e)}`,
         severity: 'error',
       });
     }

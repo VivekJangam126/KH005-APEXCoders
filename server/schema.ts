@@ -6,10 +6,34 @@ export interface ColumnMetadata {
   dataType: string;
   isNullable: boolean;
   isPrimaryKey: boolean;
+  distinctValues?: string[];
   foreignKey?: {
     targetTable: string;
     targetColumn: string;
   };
+}
+
+export async function hydrateDistinctValues(
+  db: DatabaseAdapter,
+  schemaName: string,
+  tables: TableMetadata[],
+): Promise<TableMetadata[]> {
+  for (const table of tables) {
+    for (const column of table.columns) {
+      if (!['TEXT', 'CHARACTER VARYING', 'CHAR', 'VARCHAR'].includes(column.dataType)) {
+        continue;
+      }
+      const result = await db.query<{ value: string }>(
+        `SELECT DISTINCT "${column.name}"::text AS value
+         FROM "${schemaName}"."${table.name}"
+         WHERE "${column.name}" IS NOT NULL
+         ORDER BY value
+         LIMIT 1000`,
+      );
+      column.distinctValues = result.rows.map(row => row.value).filter(value => value !== null);
+    }
+  }
+  return tables;
 }
 
 export interface TableMetadata {

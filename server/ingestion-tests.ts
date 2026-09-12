@@ -14,6 +14,7 @@ import os from 'os';
 import path from 'path';
 import { parseAndValidateCsv, sanitizeIdentifier } from './csv.ts';
 import { DocumentIngestionAgent } from './ingestion-agent.ts';
+import { profileDataset } from './profiler.ts';
 
 let passed = 0;
 let failed = 0;
@@ -26,6 +27,40 @@ function assert(condition: boolean, label: string, detail?: string) {
     console.error(`  ✗ ${label}${detail ? ': ' + detail : ''}`);
     failed++;
   }
+}
+
+{
+  console.log('\n[1.7] Empty rows and columns are removed before import');
+  const result = parseAndValidateCsv(Buffer.from(
+    'name,empty_column,score\nAlice,,10\n,,\nBob,,20\n'
+  ), 'fixture_cleaning.csv');
+  assert(result.totalRows === 2, 'empty data row removed', `got ${result.totalRows}`);
+  assert(result.columns.length === 2, 'empty column removed', `got ${result.columns.length}`);
+  assert(!result.columns.some(column => column.originalName === 'empty_column'), 'empty column is absent');
+}
+
+{
+  console.log('\n[1.8] Deterministic dataset profiling');
+  const profile = profileDataset(
+    [
+      { id: 1, amount: 10.5, active: true, date: '2025-01-01', category: 'A' },
+      { id: 2, amount: 20.5, active: false, date: '2025-01-02', category: 'B' },
+      { id: 2, amount: null, active: false, date: 'invalid', category: 'B' },
+    ],
+    [
+      { internalName: 'id', originalName: 'id' },
+      { internalName: 'amount', originalName: 'amount' },
+      { internalName: 'active', originalName: 'active' },
+      { internalName: 'date', originalName: 'date' },
+      { internalName: 'category', originalName: 'category' },
+    ],
+    'profile-fixture.csv'
+  );
+  assert(profile.rows === 3 && profile.columns === 5, 'profile dimensions are correct');
+  assert(profile.duplicateRows === 0, 'duplicate row count is correct');
+  assert(profile.columnsProfile.find(column => column.name === 'amount')?.detectedType === 'float', 'numeric type detected');
+  assert(profile.columnsProfile.find(column => column.name === 'date')?.detectedType === 'text', 'mixed date values remain text');
+  assert(profile.columnsProfile.find(column => column.name === 'id')?.possiblePrimaryKey === false, 'non-unique identifier is not a primary key');
 }
 
 // ---------------------------------------------------------------------------

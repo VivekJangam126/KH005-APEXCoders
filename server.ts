@@ -1,14 +1,12 @@
-import express from 'express';
+import express, { type Express } from 'express';
 import path from 'path';
 import cookieParser from 'cookie-parser';
 import { createServer as createViteServer } from 'vite';
 import { apiRouter } from './server/routes.ts';
 import { getDb } from './server/db.ts';
-import { config } from './server/config.ts';
 
-async function startServer() {
+export async function createApp(): Promise<Express> {
   const app = express();
-  const PORT = 3000;
 
   // Universal Origin & CORS handling (supports all origins, iframes, preview URLs, and dev environments)
   app.use((req, res, next) => {
@@ -30,21 +28,6 @@ async function startServer() {
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
   app.use(cookieParser());
 
-  // Initialize database & run migrations on boot
-  try {
-    console.log('Bootstrapping ClaritySQL database layer...');
-    await getDb();
-    console.log('Database layer ready.');
-    try {
-      const { seedDemoOrganizationsAndUsers } = await import('./server/demo-seed.ts');
-      await seedDemoOrganizationsAndUsers();
-    } catch (seedErr) {
-      console.warn('Demo seed non-fatal warning:', seedErr);
-    }
-  } catch (err) {
-    console.error('Failed to initialize database on startup:', err);
-  }
-
   // Mount API routes FIRST
   app.use('/api', apiRouter);
 
@@ -62,7 +45,7 @@ async function startServer() {
   // Vite middleware for development vs static build in production
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true, host: '0.0.0.0', port: PORT },
+      server: { middlewareMode: true, host: '0.0.0.0', port: 3000 },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -74,12 +57,31 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ClaritySQL server running on http://0.0.0.0:${PORT}`);
+  return app;
+}
+
+async function startServer() {
+  const app = await createApp();
+  try {
+    console.log('Bootstrapping ClaritySQL database layer...');
+    await getDb();
+    console.log('Database layer ready.');
+    if (process.env.NODE_ENV !== 'production') {
+      const { seedDemoOrganizationsAndUsers } = await import('./server/demo-seed.ts');
+      await seedDemoOrganizationsAndUsers();
+    }
+  } catch (err) {
+    console.error('Failed to initialize database on startup:', err);
+  }
+
+  app.listen(3000, '0.0.0.0', () => {
+    console.log('ClaritySQL server running on http://0.0.0.0:3000');
   });
 }
 
-startServer().catch(err => {
-  console.error('Fatal error starting server:', err);
-  process.exit(1);
-});
+if (process.env.VERCEL !== '1') {
+  startServer().catch(err => {
+    console.error('Fatal error starting server:', err);
+    process.exit(1);
+  });
+}

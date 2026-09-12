@@ -11,7 +11,7 @@ export const config = {
   geminiApiKey: process.env.GEMINI_API_KEY || '',
   geminiModel: process.env.GEMINI_MODEL && process.env.GEMINI_MODEL.trim()
     ? process.env.GEMINI_MODEL.trim()
-    : 'gemini-2.0-flash',
+    : 'gemini-3.6-flash',
   
   // Universal Database configuration:
   // Standard PostgreSQL connection URL (e.g. Cloud SQL, Supabase, Neon, RDS, or local PG)

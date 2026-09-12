@@ -14,8 +14,8 @@ fs.writeFileSync(p,
 # Get one free at https://aistudio.google.com
 GEMINI_API_KEY=your-gemini-api-key-here
 
-# Optional: Gemini model override (default: gemini-2.0-flash)
-GEMINI_MODEL=gemini-2.0-flash
+# Optional: Gemini model override (default: gemini-3.6-flash)
+GEMINI_MODEL=gemini-3.6-flash
 
 # Required: PostgreSQL connection string
 # Example: postgresql://user:password@host:5432/dbname

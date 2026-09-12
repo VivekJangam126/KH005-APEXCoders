@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   Upload,
   FileSpreadsheet,
@@ -28,23 +28,51 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
   const [tableName, setTableName] = useState('');
   const [isUploading, setIsUploading] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState({ completedRows: 0, totalRows: 0, percent: 0 });
+  const [processProgress, setProcessProgress] = useState({ stage: '', percent: 0, state: 'idle' as 'idle' | 'processing' | 'success' | 'error' });
   const [error, setError] = useState<string | null>(null);
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDragOver, setIsDragOver] = useState(false);
 
+  const resetWizard = () => {
+    setStep('upload');
+    setFile(null);
+    setUploadInfo(null);
+    setDatasetName('');
+    setTableName('');
+    setIsUploading(false);
+    setIsImporting(false);
+    setImportProgress({ completedRows: 0, totalRows: 0, percent: 0 });
+    setProcessProgress({ stage: '', percent: 0, state: 'idle' });
+    setError(null);
+    setShowDiscardConfirm(false);
+    setIsDragOver(false);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  useEffect(() => {
+    if (isOpen) {
+      resetWizard();
+    }
+  }, [isOpen]);
+
   if (!isOpen) return null;
 
   const handleFileDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragOver(false);
+    if (isUploading || isImporting) return;
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       processFile(e.dataTransfer.files[0]);
     }
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (isUploading || isImporting) return;
     if (e.target.files && e.target.files.length > 0) {
       processFile(e.target.files[0]);
     }
@@ -60,9 +88,22 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
     setFile(f);
     setError(null);
     setIsUploading(true);
+    setProcessProgress({ stage: 'Uploading', percent: 10, state: 'processing' });
+    const stages = [
+      { stage: 'Reading file', percent: 28 },
+      { stage: 'Profiling', percent: 45 },
+      { stage: 'Validating', percent: 62 },
+    ];
+    const stageTimer = window.setInterval(() => {
+      setProcessProgress(current => {
+        const next = stages.find(item => item.percent > current.percent);
+        return next ? { ...next, state: 'processing' } : current;
+      });
+    }, 700);
 
     try {
       const info = await api.uploads.uploadCsv(f);
+      setProcessProgress({ stage: 'Complete', percent: 100, state: 'success' });
       setUploadInfo(info);
       // Auto default table name from filename
       const defaultTable = f.name.replace(/\.[^/.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase();
@@ -72,7 +113,9 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
     } catch (err: any) {
       console.error('CSV upload error:', err);
       setError(err.message || 'Failed to process CSV');
+      setProcessProgress({ stage: 'Upload failed', percent: 100, state: 'error' });
     } finally {
+      window.clearInterval(stageTimer);
       setIsUploading(false);
     }
   };
@@ -80,20 +123,40 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
   const handleImport = async () => {
     if (!uploadInfo) return;
     setIsImporting(true);
+    setStep('importing');
+    setProcessProgress({ stage: 'Creating table', percent: 72, state: 'processing' });
+    setImportProgress({ completedRows: 0, totalRows: uploadInfo.totalRows, percent: 0 });
     setError(null);
 
     try {
-      await api.uploads.importDataset(uploadInfo.uploadId, datasetName.trim(), tableName.trim());
+      const importRequest = api.uploads.importDataset(uploadInfo.uploadId, datasetName.trim(), tableName.trim());
+      let finished = false;
+      while (!finished) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+        const progress = await api.uploads.getImportProgress(uploadInfo.uploadId);
+        setImportProgress(progress);
+        setProcessProgress({
+          stage: progress.status === 'completed' ? 'Complete' : 'Storing data',
+          percent: progress.status === 'completed' ? 100 : 75 + Math.round(progress.percent * 0.2),
+          state: progress.status === 'failed' ? 'error' : progress.status === 'completed' ? 'success' : 'processing',
+        });
+        finished = progress.status !== 'importing';
+      }
+      await importRequest;
       await onSuccess();
+      resetWizard();
       onClose();
     } catch (err: any) {
       console.error('Import error:', err);
       setError(err.message || 'Failed to import dataset into PostgreSQL');
+      setProcessProgress({ stage: 'Import failed', percent: 100, state: 'error' });
+      setStep('preview');
       setIsImporting(false);
     }
   };
 
   const handleCloseAttempt = () => {
+    if (isUploading || isImporting) return;
     if (step === 'preview' && uploadInfo) {
       setShowDiscardConfirm(true);
     } else {
@@ -115,7 +178,7 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
             </div>
             <div>
               <h3 className="font-semibold text-base text-slate-900 dark:text-white">
-                Import CSV into PostgreSQL
+                Import CSV or Excel into PostgreSQL
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400">
                 Type-inferred staging with automatic schema extraction
@@ -139,12 +202,33 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
             </div>
           )}
 
+          {step === 'importing' && (
+            <div className="flex items-center gap-3 rounded-xl border border-indigo-200 bg-indigo-50/70 p-3 text-xs text-indigo-700 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-300">
+              <div className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-indigo-600 border-t-transparent" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="font-medium">Uploading rows to PostgreSQL...</span>
+                  <span className="font-mono">
+                    {importProgress.completedRows.toLocaleString()} / {importProgress.totalRows.toLocaleString()}
+                  </span>
+                </div>
+                <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-indigo-100 dark:bg-indigo-900">
+                  <div
+                    className="h-full rounded-full bg-indigo-600 transition-all duration-200"
+                    style={{ width: `${importProgress.percent}%` }}
+                  />
+                </div>
+                <div className="mt-1 text-[10px]">{importProgress.percent}% complete</div>
+              </div>
+            </div>
+          )}
+
           {step === 'upload' && (
             <div className="space-y-6">
               <div>
                 <h3 className="text-xl font-bold text-slate-900 dark:text-white mb-1">Import Data</h3>
                 <p className="text-slate-500 dark:text-slate-400 text-sm">
-                  Select a dataset file (CSV, Excel, JSON, PDF, etc.) to ingest and analyze.
+                  Select a CSV or Excel dataset to clean, validate, and import.
                 </p>
               </div>
 
@@ -156,8 +240,10 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
                 }}
                 onDragLeave={() => setIsDragOver(false)}
                 onDrop={handleFileDrop}
-                onClick={() => fileInputRef.current?.click()}
-                className={`border-2 border-dashed rounded-2xl p-8 text-center cursor-pointer transition-all ${
+                onClick={() => !isUploading && fileInputRef.current?.click()}
+                className={`border-2 border-dashed rounded-2xl p-8 text-center transition-all ${
+                  isUploading ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'
+                } ${
                   isDragOver
                     ? 'border-indigo-600 bg-indigo-50/40 dark:bg-indigo-950/20'
                     : 'border-slate-200 dark:border-slate-700 hover:border-indigo-400 hover:bg-slate-50/60 dark:hover:bg-slate-800/40'
@@ -167,6 +253,7 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
                   type="file"
                   ref={fileInputRef}
                   onChange={handleFileSelect}
+                  disabled={isUploading || isImporting}
                   accept=".csv,.tsv,.xlsx,.xls,.json,.jsonl,.txt,.md,.pdf,.docx,.png,.jpg,.jpeg,.webp"
                   className="hidden"
                 />
@@ -176,17 +263,21 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
                 </div>
 
                 <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
-                  Click to choose a CSV or drag and drop here
+                  Click to choose a CSV or Excel file, or drag and drop here
                 </p>
                 <p className="text-xs text-slate-400 dark:text-slate-500 mt-1">
-                  Supports comma or semicolon delimited files up to 25MB
+                  Supports CSV, TSV, XLS, and XLSX files up to 25MB
                 </p>
               </div>
 
               {isUploading && (
-                <div className="flex items-center justify-center gap-2 text-xs text-slate-500 py-3">
-                  <div className="w-4 h-4 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
-                  <span>Staging CSV and inferring PostgreSQL column types...</span>
+                <div className="rounded-xl border border-indigo-200 bg-indigo-50/70 p-3 text-xs text-indigo-700 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-300">
+                  <div className="flex items-center justify-between font-medium">
+                    <span>{processProgress.stage}</span><span>{processProgress.percent}%</span>
+                  </div>
+                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-indigo-100 dark:bg-indigo-900">
+                    <div className="h-full rounded-full bg-indigo-600 transition-all" style={{ width: `${processProgress.percent}%` }} />
+                  </div>
                 </div>
               )}
             </div>
@@ -217,6 +308,22 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
                   </p>
                 </div>
               </div>
+
+              {uploadInfo.profile && (
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs dark:border-slate-700 dark:bg-slate-800/60">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-slate-700 dark:text-slate-200">Dataset profile</span>
+                    <span className="text-slate-400">{uploadInfo.profile.profilingMs} ms local scan</span>
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-slate-500 dark:text-slate-400">
+                    <span>{uploadInfo.profile.duplicateRows} duplicate rows</span>
+                    <span>{uploadInfo.profile.warnings.length} quality warnings</span>
+                    <span>{uploadInfo.profile.emptyColumns.length} empty columns removed</span>
+                    {uploadInfo.semanticAnalysis?.status === 'available' && <span className="text-emerald-600">AI schema analysis ready</span>}
+                    {uploadInfo.semanticAnalysis?.status === 'unavailable' && <span>AI analysis unavailable; local profile used</span>}
+                  </div>
+                </div>
+              )}
 
               {/* Dataset and Table Naming */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -273,6 +380,17 @@ export function CsvImportWizard({ isOpen, onClose, onSuccess }: CsvImportWizardP
                   ))}
                 </div>
               </div>
+
+              {uploadInfo.issues.length > 0 && (
+                <div className="p-3 rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 text-xs text-amber-800 dark:text-amber-200">
+                  <p className="font-semibold mb-1">Cleaning applied</p>
+                  <ul className="list-disc pl-4 space-y-0.5">
+                    {uploadInfo.issues.slice(0, 5).map((issue, idx) => (
+                      <li key={idx}>{issue.message}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
               {/* Sample Data Preview */}
               {uploadInfo.previewRows && uploadInfo.previewRows.length > 0 && (

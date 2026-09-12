@@ -42,6 +42,10 @@ export function ChartCard({ columns, rows, insight }: ChartCardProps) {
   if (rows.length === 0 || columns.length === 0) {
     return null;
   }
+  if (insight?.chartRecommendation?.visualizationNeeded === false ||
+      insight?.chartRecommendation?.type === 'table') {
+    return null;
+  }
 
   // Detect candidate numeric and categorical keys
   let categoryKey = insight?.chartRecommendation?.xAxisKey;
@@ -54,9 +58,19 @@ export function ChartCard({ columns, rows, insight }: ChartCardProps) {
   if (!numericKey) {
     numericKey = columns.find(c => typeof firstRow[c.name] === 'number')?.name || columns[1]?.name;
   }
+  const hasValidAxes = Boolean(
+    categoryKey &&
+    numericKey &&
+    columns.some(column => column.name === categoryKey) &&
+    columns.some(column => column.name === numericKey) &&
+    rows.some(row => typeof row[numericKey!] === 'number' || Number.isFinite(Number(row[numericKey!])))
+  );
+  if (!hasValidAxes && chartType !== 'value_card') {
+    return null;
+  }
 
   // Value Card representation for single cell / scalar
-  if (chartType === 'value_card' || (rows.length === 1 && columns.length <= 2)) {
+  if (chartType === 'value_card') {
     const val = numericKey ? rows[0][numericKey] : Object.values(rows[0])[0];
     const label = numericKey || Object.keys(rows[0])[0];
 
